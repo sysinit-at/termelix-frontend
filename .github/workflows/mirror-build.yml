@@ -1,0 +1,34 @@
+# CI for the public mirror (github.com/sysinit-at/termelix-frontend).
+#
+# The publish script strips every other workflow file: the remaining upstream
+# workflows (release, electron, docker, …) expect upstream secrets and would
+# only fail noisily on the mirror. This one proves the SPA builds and the unit
+# suite passes — the same `--ignore-scripts` install the Termelix image build
+# uses.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm install --ignore-scripts --no-audit --no-fund
+
+      - run: npx vite build
+
+      - run: npm test

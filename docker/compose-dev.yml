@@ -1,0 +1,18 @@
+services:
+  termix-dev:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: termix-dev
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      - termix-dev-data:/app/data
+    environment:
+      PORT: "8080"
+      NODE_ENV: development
+
+volumes:
+  termix-dev-data:
+    driver: local

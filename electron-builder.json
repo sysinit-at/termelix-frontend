@@ -1,0 +1,149 @@
+{
+  "appId": "com.karmaa.termelix",
+  "productName": "Termelix",
+  "publish": null,
+  "directories": {
+    "output": "release"
+  },
+  "asar": true,
+  "asarUnpack": [
+    "dist/backend/**/*",
+    "node_modules/**/*",
+    "public/icons/**/*",
+    "public/icon.*"
+  ],
+  "files": [
+    "dist/**/*",
+    "electron/**/*",
+    "public/**/*",
+    "!src/**/*",
+    "!*.md",
+    "!tsconfig*.json",
+    "!vite.config.ts",
+    "!eslint.config.js",
+    "!node_modules/@napi-rs/canvas*/**/*",
+    "!node_modules/@rollup/rollup-darwin-*/**/*",
+    "!node_modules/@rollup/rollup-linux-*/**/*",
+    "!node_modules/@rollup/rollup-win32-*/**/*",
+    "!dist/icon-mac.png",
+    "!public/icon-mac.png",
+    "!dist/icon.ico",
+    "!dist/icon.icns",
+    "!public/icon.icns"
+  ],
+  "extraMetadata": {
+    "main": "electron/main.cjs",
+    "type": "commonjs"
+  },
+  "buildDependenciesFromSource": false,
+  "nodeGypRebuild": false,
+  "npmRebuild": true,
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64", "ia32"]
+      },
+      {
+        "target": "msi",
+        "arch": ["x64", "ia32"]
+      }
+    ],
+    "icon": "public/icon.ico",
+    "executableName": "Termelix"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "artifactName": "termelix_windows_${arch}_nsis.${ext}",
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "installerIcon": "public/icon.ico",
+    "uninstallerIcon": "public/icon.ico",
+    "shortcutName": "Termelix",
+    "uninstallDisplayName": "Termelix"
+  },
+  "msi": {
+    "artifactName": "termelix_windows_${arch}_msi.${ext}"
+  },
+  "linux": {
+    "artifactName": "termelix_linux_${arch}_portable.${ext}",
+    "target": [
+      {
+        "target": "AppImage",
+        "arch": ["x64", "arm64", "armv7l"]
+      },
+      {
+        "target": "deb",
+        "arch": ["x64", "arm64", "armv7l"]
+      },
+      {
+        "target": "tar.gz",
+        "arch": ["x64", "arm64", "armv7l"]
+      }
+    ],
+    "icon": "public/icon.png",
+    "category": "Development",
+    "executableName": "termelix",
+    "maintainer": "Termelix <mail@termelix.site>",
+    "desktop": {
+      "entry": {
+        "Name": "Termelix",
+        "Comment": "Self-hosted SSH management. ",
+        "Keywords": "docker;ssh;terminal;self-hosted;file-management;ssh-tunnel;server-stats;termelix",
+        "StartupWMClass": "termelix"
+      }
+    }
+  },
+  "appImage": {
+    "artifactName": "termelix_linux_${arch}_appimage.${ext}"
+  },
+  "deb": {
+    "artifactName": "termelix_linux_${arch}_deb.${ext}"
+  },
+  "mac": {
+    "target": [
+      {
+        "target": "mas",
+        "arch": "universal"
+      },
+      {
+        "target": "dmg",
+        "arch": ["universal", "x64", "arm64"]
+      }
+    ],
+    "icon": "public/icon.icns",
+    "category": "public.app-category.developer-tools",
+    "hardenedRuntime": true,
+    "gatekeeperAssess": false,
+    "entitlements": "packaging/build/entitlements.mac.plist",
+    "entitlementsInherit": "packaging/build/entitlements.mac.inherit.plist",
+    "type": "distribution",
+    "minimumSystemVersion": "10.15",
+    "mergeASARs": false,
+    "singleArchFiles": "**/*.{node,bare}",
+    "x64ArchFiles": "**/*.{node,bare}"
+  },
+  "dmg": {
+    "artifactName": "termelix_macos_${arch}_dmg.${ext}",
+    "sign": true
+  },
+  "beforeBuild": "packaging/build/before-build.cjs",
+  "afterPack": "packaging/build/after-pack.cjs",
+  "afterSign": "packaging/build/notarize.cjs",
+  "mas": {
+    "provisioningProfile": "packaging/build/Termix_Mac_App_Store.provisionprofile",
+    "entitlements": "packaging/build/entitlements.mas.plist",
+    "entitlementsInherit": "packaging/build/entitlements.mas.inherit.plist",
+    "hardenedRuntime": false,
+    "gatekeeperAssess": false,
+    "type": "distribution",
+    "category": "public.app-category.developer-tools",
+    "artifactName": "termelix_macos_${arch}_mas.${ext}",
+    "extendInfo": {
+      "ITSAppUsesNonExemptEncryption": false,
+      "NSAppleEventsUsageDescription": "Termelix needs access to control other applications for terminal operations."
+    }
+  },
+  "generateUpdatesFilesForAllChannels": true
+}

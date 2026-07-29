@@ -1,0 +1,5 @@
+{
+  "project": "tsconfig.app.json",
+  "errors": 165,
+  "note": "Ceiling, not a target. Lower it with `npm run type-check -- --update` after fixing some."
+}

@@ -1,0 +1,3226 @@
+/* eslint-disable react-hooks/exhaustive-deps */
+import {
+  useEffect,
+  useRef,
+  useState,
+  useImperativeHandle,
+  forwardRef,
+  useCallback,
+} from "react";
+import { createPortal } from "react-dom";
+import { useXTerm } from "react-xtermjs";
+import { FitAddon } from "@xterm/addon-fit";
+import { ClipboardAddon } from "@xterm/addon-clipboard";
+import { RobustClipboardProvider } from "@/lib/clipboard-provider";
+import { copyToClipboard } from "@/lib/clipboard";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { useTranslation } from "react-i18next";
+import { getBasePath } from "@/lib/base-path";
+import {
+  getCookie,
+  isElectron,
+  isEmbeddedMode,
+  logActivity,
+  deleteCommandFromHistory,
+  getCommandHistory,
+  getServerConfig,
+} from "@/main-axios.ts";
+import { TOTPDialog } from "@/ssh/dialogs/TOTPDialog.tsx";
+import { SSHAuthDialog } from "@/ssh/dialogs/SSHAuthDialogLazy.tsx";
+import { PassphraseDialog } from "@/ssh/dialogs/PassphraseDialog.tsx";
+import { WarpgateDialog } from "@/ssh/dialogs/WarpgateDialog.tsx";
+import { OPKSSHDialog } from "@/ssh/dialogs/OPKSSHDialog.tsx";
+import { HostKeyVerificationDialog } from "@/ssh/dialogs/HostKeyVerificationDialog.tsx";
+import { TmuxSessionPicker } from "@/ssh/dialogs/TmuxSessionPicker.tsx";
+import {
+  DEFAULT_TERMINAL_CONFIG,
+  TERMINAL_FONTS,
+} from "@/lib/terminal-themes.ts";
+import "./terminal-global-styles.ts";
+import { useTheme } from "@/components/theme-provider.tsx";
+import { globalShortcutHandler } from "@/lib/global-shortcut-handler";
+import { useCommandTracker } from "@/features/terminal/command-history/useCommandTracker.ts";
+import { highlightTerminalOutput } from "@/lib/terminal-syntax-highlighter.ts";
+import { useCommandHistory } from "@/features/terminal/command-history/CommandHistoryContext.tsx";
+import { CommandAutocomplete } from "./command-history/CommandAutocomplete.tsx";
+import { SimpleLoader } from "@/lib/SimpleLoader.tsx";
+import {
+  ConnectionLogProvider,
+  useConnectionLog,
+} from "@/ssh/connection-log/ConnectionLogContext.tsx";
+import { ConnectionLog } from "@/ssh/connection-log/ConnectionLog.tsx";
+import { toast } from "sonner";
+import { Button } from "@/components/button";
+import { resolveTermelixThemeColors } from "./terminal-theme.ts";
+import { attachBell, type BellStyle } from "@/lib/terminal-bell";
+import { classifyErrorFrame } from "./error-policy";
+import type { TerminalHandle, TerminalHostConfig } from "./terminal-types.ts";
+import {
+  getNextTerminalFontSize,
+  getTerminalFontZoomDirection,
+} from "./terminal-font-zoom.ts";
+export type { TerminalHandle, TerminalHostConfig } from "./terminal-types.ts";
+import {
+  attachFrame,
+  connectFrame,
+  frameSeq,
+  replayIsReset,
+  resumeFrame,
+  serverCanResume,
+} from "./protocol";
+
+type HostKeyVerificationData = Omit<
+  React.ComponentProps<typeof HostKeyVerificationDialog>,
+  "isOpen" | "scenario" | "onAccept" | "onReject" | "backgroundColor"
+>;
+
+interface SSHTerminalProps {
+  hostConfig: TerminalHostConfig;
+  isVisible: boolean;
+  title?: string;
+  showTitle?: boolean;
+  splitScreen?: boolean;
+  onClose?: () => void;
+  onTitleChange?: (title: string) => void;
+  initialPath?: string;
+  executeCommand?: string;
+  /** Attach to this tmux session right after connecting (tmux monitor). */
+  tmuxAttachSession?: string;
+  onOpenFileManager?: (path?: string) => void;
+  onOpenFileInEditor?: (filePath: string) => void;
+  previewTheme?: string | null;
+  /** When true, suppress automatic focus on connect/visibility change. */
+  disableAutoFocus?: boolean;
+}
+
+const ALTERNATE_SCREEN_SEQUENCE = /\x1b\[\?(47|1047|1049)([hl])/g;
+
+function updateAlternateScreenMode(output: string, currentMode: boolean) {
+  ALTERNATE_SCREEN_SEQUENCE.lastIndex = 0;
+  let isActive = currentMode;
+  let sawSequence = false;
+  let match: RegExpExecArray | null;
+
+  while ((match = ALTERNATE_SCREEN_SEQUENCE.exec(output)) !== null) {
+    sawSequence = true;
+    isActive = match[2] === "h";
+  }
+
+  return { isActive, sawSequence };
+}
+
+const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
+  function SSHTerminal(
+    {
+      hostConfig,
+      isVisible,
+      splitScreen = false,
+      onClose,
+      onTitleChange,
+      initialPath,
+      executeCommand,
+      tmuxAttachSession,
+      onOpenFileManager,
+      onOpenFileInEditor,
+      previewTheme,
+      disableAutoFocus = false,
+    },
+    ref,
+  ) {
+    const { t } = useTranslation();
+    const { instance: terminal, ref: xtermRef } = useXTerm();
+    const commandHistoryContext = useCommandHistory();
+    const { theme: appTheme } = useTheme();
+    const { addLog, isExpanded: isConnectionLogExpanded } = useConnectionLog();
+
+    const savedTheme = localStorage.getItem(
+      `terminal_theme_host_${hostConfig.id}`,
+    );
+    const config = {
+      ...DEFAULT_TERMINAL_CONFIG,
+      ...hostConfig.terminalConfig,
+      theme:
+        savedTheme ||
+        hostConfig.terminalConfig?.theme ||
+        DEFAULT_TERMINAL_CONFIG.theme,
+    };
+
+    const activeTheme = previewTheme || config.theme;
+    const themeColors = resolveTermelixThemeColors(
+      activeTheme,
+      appTheme,
+      config.customThemeColors,
+    );
+    const backgroundImage = config.backgroundImage || "";
+    const backgroundImageOpacity = config.backgroundImageOpacity ?? 0.15;
+    const backgroundColor = backgroundImage
+      ? "transparent"
+      : themeColors.background;
+    const fitAddonRef = useRef<FitAddon | null>(null);
+    const webSocketRef = useRef<WebSocket | null>(null);
+    const resizeTimeout = useRef<NodeJS.Timeout | null>(null);
+    const wasDisconnectedBySSH = useRef(false);
+    const pingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+    const pongReceivedRef = useRef(true);
+    const pongTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const [isConnected, setIsConnected] = useState(false);
+    const [isConnecting, setIsConnecting] = useState(false);
+    const [isFitted, setIsFitted] = useState(false);
+    const [connectionError, setConnectionError] = useState<string | null>(null);
+    const connectionErrorRef = useRef<string | null>(null);
+    const [showDisconnectedOverlay, setShowDisconnectedOverlay] =
+      useState(false);
+
+    const updateConnectionError = useCallback((error: string | null) => {
+      connectionErrorRef.current = error;
+      setConnectionError(error);
+    }, []);
+
+    const [, setIsAuthenticated] = useState(false);
+    const [totpRequired, setTotpRequired] = useState(false);
+    const [totpPrompt, setTotpPrompt] = useState<string>("");
+    const [isPasswordPrompt, setIsPasswordPrompt] = useState(false);
+    const [showAuthDialog, setShowAuthDialog] = useState(false);
+    const [authDialogReason, setAuthDialogReason] = useState<
+      "no_keyboard" | "auth_failed" | "timeout"
+    >("no_keyboard");
+    const [showPassphraseDialog, setShowPassphraseDialog] = useState(false);
+    const [, setKeyboardInteractiveDetected] = useState(false);
+    const [warpgateAuthRequired, setWarpgateAuthRequired] = useState(false);
+    const [warpgateAuthUrl, setWarpgateAuthUrl] = useState<string>("");
+    const [warpgateSecurityKey, setWarpgateSecurityKey] = useState<string>("");
+    const warpgateTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+    const [opksshDialog, setOpksshDialog] = useState<{
+      isOpen: boolean;
+      authUrl: string;
+      requestId: string;
+      stage: "chooser" | "waiting" | "authenticating" | "completed" | "error";
+      error?: string;
+      providers?: Array<{ alias: string; issuer: string }>;
+    } | null>(null);
+    const opksshTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+    const opksshFailedRef = useRef(false);
+    const currentHostIdRef = useRef<number | null>(null);
+    const currentHostConfigRef = useRef<TerminalHostConfig | null>(null);
+
+    // Vault SSH signer interactive OIDC flow
+    const [vaultDialog, setVaultDialog] = useState<{
+      stage: "waiting" | "error";
+      error?: string;
+    } | null>(null);
+    const vaultFailedRef = useRef(false);
+    const vaultPopupRef = useRef<Window | null>(null);
+    const vaultTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+    const [hostKeyVerification, setHostKeyVerification] = useState<{
+      isOpen: boolean;
+      scenario: "new" | "changed";
+      data: HostKeyVerificationData;
+    } | null>(null);
+
+    const sessionIdRef = useRef<string | null>(null);
+    /**
+     * How far into the session's output stream this terminal has rendered, and WHICH session
+     * that position belongs to.
+     *
+     * The pairing is the whole correctness argument. A sequence is an offset into one session's
+     * byte stream and means nothing in another's: after a server restart the tmux work survives
+     * but the BEAM session does not, so the replacement stream starts at zero while the client
+     * still holds a large offset from the dead one. Send that number and the server is asked
+     * for the delta after a point its stream never reached — which is not "nothing to send",
+     * it is a question about a different stream, and answering it with silence is a blank
+     * terminal. So the id travels with the offset and the offset is only ever sent back to the
+     * session that issued it.
+     *
+     * A ref and not state: it updates on every data frame, and a re-render per chunk of
+     * terminal output would be its own performance bug.
+     */
+    const lastSeqRef = useRef<{ sessionId: string; seq: number } | null>(null);
+    const isAttachingSessionRef = useRef<boolean>(false);
+    // Consumed on first connectToHost call so retries don't re-attempt a stale session
+    const pendingRestoredSessionIdRef = useRef<string | null>(
+      hostConfig.restoredSessionId ?? null,
+    );
+    const [linkClickDialog, setLinkClickDialog] = useState<{
+      url: string;
+    } | null>(null);
+
+    useEffect(() => {
+      if (!linkClickDialog) return;
+
+      const handleKeyDown = (event: KeyboardEvent) => {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        event.stopPropagation();
+        setLinkClickDialog(null);
+      };
+
+      window.addEventListener("keydown", handleKeyDown, true);
+      return () => window.removeEventListener("keydown", handleKeyDown, true);
+    }, [linkClickDialog]);
+
+    const [tmuxSessionPicker, setTmuxSessionPicker] = useState<{
+      sessions: Array<{
+        name: string;
+        created: number;
+        lastActivity: number;
+        windows: number;
+        attachedClients: number;
+      }>;
+    } | null>(null);
+    const tmuxSessionNameRef = useRef<string | null>(null);
+    const [isTmuxAttached, setIsTmuxAttached] = useState(false);
+    const tmuxCopyModeHintShownRef = useRef(false);
+
+    const isVisibleRef = useRef<boolean>(false);
+    const isFittingRef = useRef(false);
+    const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const reconnectAttempts = useRef(0);
+    const maxReconnectAttempts = 8;
+    const isUnmountingRef = useRef(false);
+    const shouldNotReconnectRef = useRef(false);
+    const isReconnectingRef = useRef(false);
+    const isConnectingRef = useRef(false);
+    const wasConnectedRef = useRef(false);
+    const wasSessionExpiredRef = useRef(false);
+    /**
+     * One resume attempt per socket. A binding whose tmux session really is gone answers with
+     * an error, and the fallback opens a fresh shell; without this the client would keep asking
+     * to resume something that no longer exists.
+     */
+    const resumeAttemptedRef = useRef(false);
+    /**
+     * A `resumeBinding` is in flight. Set when the frame goes out, cleared by `bindingResumed`,
+     * by the error handler that falls back to a fresh shell, and on close so it cannot leak
+     * into the next socket. This is what distinguishes "the resume was refused" from any other
+     * error frame — the server reports both the same way.
+     */
+    const resumePendingRef = useRef(false);
+
+    useEffect(() => {
+      isUnmountingRef.current = false;
+      shouldNotReconnectRef.current = false;
+      isReconnectingRef.current = false;
+      isConnectingRef.current = false;
+      reconnectAttempts.current = 0;
+      wasConnectedRef.current = false;
+      isAttachingSessionRef.current = false;
+
+      return () => {};
+    }, [hostConfig.id]);
+    const connectionAttemptIdRef = useRef(0);
+    const totpTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const connectionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const activityLoggedRef = useRef(false);
+    const commandHistoryTrackingEnabled =
+      hostConfig.enableCommandHistory !== false;
+
+    const { trackInput, getCurrentCommand, updateCurrentCommand } =
+      useCommandTracker({
+        hostId: hostConfig.id,
+        enabled: commandHistoryTrackingEnabled,
+        onCommandExecuted: (command) => {
+          if (!autocompleteHistory.current.includes(command)) {
+            autocompleteHistory.current = [
+              command,
+              ...autocompleteHistory.current,
+            ];
+          }
+        },
+      });
+
+    const getCurrentCommandRef = useRef(getCurrentCommand);
+    const updateCurrentCommandRef = useRef(updateCurrentCommand);
+
+    useEffect(() => {
+      getCurrentCommandRef.current = getCurrentCommand;
+      updateCurrentCommandRef.current = updateCurrentCommand;
+    }, [getCurrentCommand, updateCurrentCommand]);
+
+    const [showAutocomplete, setShowAutocomplete] = useState(false);
+    const [autocompleteSuggestions, setAutocompleteSuggestions] = useState<
+      string[]
+    >([]);
+    const [autocompleteSelectedIndex, setAutocompleteSelectedIndex] =
+      useState(0);
+    const [autocompletePosition, setAutocompletePosition] = useState({
+      top: 0,
+      left: 0,
+    });
+    const autocompleteHistory = useRef<string[]>([]);
+    const currentAutocompleteCommand = useRef<string>("");
+
+    const showAutocompleteRef = useRef(false);
+    const autocompleteSuggestionsRef = useRef<string[]>([]);
+    const autocompleteSelectedIndexRef = useRef(0);
+
+    const [showHistoryDialog] = useState(false);
+    const [, setCommandHistory] = useState<string[]>([]);
+    const [, setIsLoadingHistory] = useState(false);
+
+    const setIsLoadingRef = useRef(commandHistoryContext.setIsLoading);
+    const setCommandHistoryContextRef = useRef(
+      commandHistoryContext.setCommandHistory,
+    );
+
+    useEffect(() => {
+      setIsLoadingRef.current = commandHistoryContext.setIsLoading;
+      setCommandHistoryContextRef.current =
+        commandHistoryContext.setCommandHistory;
+    }, [
+      commandHistoryContext.setIsLoading,
+      commandHistoryContext.setCommandHistory,
+    ]);
+
+    useEffect(() => {
+      if (showHistoryDialog && hostConfig.id) {
+        setIsLoadingHistory(true);
+        setIsLoadingRef.current(true);
+        getCommandHistory(hostConfig.id!)
+          .then((history) => {
+            setCommandHistory(history);
+            setCommandHistoryContextRef.current(history);
+          })
+          .catch((error) => {
+            console.error("Failed to load command history:", error);
+            setCommandHistory([]);
+            setCommandHistoryContextRef.current([]);
+          })
+          .finally(() => {
+            setIsLoadingHistory(false);
+            setIsLoadingRef.current(false);
+          });
+      }
+    }, [showHistoryDialog, hostConfig.id]);
+
+    useEffect(() => {
+      const autocompleteEnabled =
+        localStorage.getItem("commandAutocomplete") === "true";
+
+      if (hostConfig.id && autocompleteEnabled) {
+        getCommandHistory(hostConfig.id!)
+          .then((history) => {
+            autocompleteHistory.current = history;
+          })
+          .catch((error) => {
+            console.error("Failed to load autocomplete history:", error);
+            autocompleteHistory.current = [];
+          });
+      } else {
+        autocompleteHistory.current = [];
+      }
+    }, [hostConfig.id]);
+
+    useEffect(() => {
+      showAutocompleteRef.current = showAutocomplete;
+    }, [showAutocomplete]);
+
+    useEffect(() => {
+      autocompleteSuggestionsRef.current = autocompleteSuggestions;
+    }, [autocompleteSuggestions]);
+
+    useEffect(() => {
+      autocompleteSelectedIndexRef.current = autocompleteSelectedIndex;
+    }, [autocompleteSelectedIndex]);
+
+    const activityLoggingRef = useRef(false);
+    const alternateScreenModeRef = useRef(false);
+
+    const lastSentSizeRef = useRef<{ cols: number; rows: number } | null>(null);
+    const pendingSizeRef = useRef<{ cols: number; rows: number } | null>(null);
+    const notifyTimerRef = useRef<NodeJS.Timeout | null>(null);
+    const lastFittedSizeRef = useRef<{ cols: number; rows: number } | null>(
+      null,
+    );
+    const terminalFontSizeRef = useRef(config.fontSize);
+    const bellStyleRef = useRef<BellStyle>(
+      (config.bellStyle ?? "none") as BellStyle,
+    );
+    const DEBOUNCE_MS = 140;
+
+    const logTerminalActivity = async () => {
+      if (
+        !hostConfig.id ||
+        activityLoggedRef.current ||
+        activityLoggingRef.current
+      ) {
+        return;
+      }
+
+      activityLoggingRef.current = true;
+      activityLoggedRef.current = true;
+
+      try {
+        const hostName =
+          hostConfig.name || `${hostConfig.username}@${hostConfig.ip}`;
+        await logActivity("terminal", hostConfig.id, hostName);
+      } catch (err) {
+        console.warn("Failed to log terminal activity:", err);
+        activityLoggedRef.current = false;
+      } finally {
+        activityLoggingRef.current = false;
+      }
+    };
+
+    useEffect(() => {
+      isVisibleRef.current = isVisible;
+    }, [isVisible]);
+
+    useEffect(() => {
+      // One-shot: historical code polled every 5s but only ever flipped false→true.
+      setIsAuthenticated(true);
+    }, []);
+
+    function hardRefresh() {
+      try {
+        if (
+          terminal &&
+          typeof (
+            terminal as { refresh?: (start: number, end: number) => void }
+          ).refresh === "function"
+        ) {
+          (
+            terminal as { refresh?: (start: number, end: number) => void }
+          ).refresh(0, terminal.rows - 1);
+        }
+      } catch (error) {
+        console.error("Terminal operation failed:", error);
+      }
+    }
+
+    function performFit() {
+      if (
+        !fitAddonRef.current ||
+        !terminal ||
+        !isVisible ||
+        isFittingRef.current
+      ) {
+        return;
+      }
+
+      isFittingRef.current = true;
+
+      try {
+        fitAddonRef.current.fit();
+        if (terminal && terminal.cols > 0 && terminal.rows > 0) {
+          const lastSize = lastFittedSizeRef.current;
+          if (
+            !lastSize ||
+            lastSize.cols !== terminal.cols ||
+            lastSize.rows !== terminal.rows
+          ) {
+            scheduleNotify(terminal.cols, terminal.rows);
+            lastFittedSizeRef.current = {
+              cols: terminal.cols,
+              rows: terminal.rows,
+            };
+          }
+        }
+        setIsFitted(true);
+      } finally {
+        isFittingRef.current = false;
+      }
+    }
+
+    function changeTerminalFontSize(direction: -1 | 1) {
+      const currentFontSize =
+        terminal.options.fontSize ??
+        terminalFontSizeRef.current ??
+        DEFAULT_TERMINAL_CONFIG.fontSize;
+      const nextFontSize = getNextTerminalFontSize(currentFontSize, direction);
+
+      if (nextFontSize === currentFontSize) {
+        return;
+      }
+
+      terminalFontSizeRef.current = nextFontSize;
+      terminal.options.fontSize = nextFontSize;
+      performFit();
+      hardRefresh();
+    }
+
+    function handleTotpSubmit(code: string) {
+      if (webSocketRef.current && code) {
+        if (totpTimeoutRef.current) {
+          clearTimeout(totpTimeoutRef.current);
+          totpTimeoutRef.current = null;
+        }
+        webSocketRef.current.send(
+          JSON.stringify({
+            type: isPasswordPrompt ? "password_response" : "totp_response",
+            data: { code },
+          }),
+        );
+        setTotpRequired(false);
+        setTotpPrompt("");
+        setIsPasswordPrompt(false);
+      }
+    }
+
+    function handleTotpCancel() {
+      if (totpTimeoutRef.current) {
+        clearTimeout(totpTimeoutRef.current);
+        totpTimeoutRef.current = null;
+      }
+      setTotpRequired(false);
+      setTotpPrompt("");
+      if (onClose) onClose();
+    }
+
+    function handleWarpgateContinue() {
+      if (webSocketRef.current) {
+        if (warpgateTimeoutRef.current) {
+          clearTimeout(warpgateTimeoutRef.current);
+          warpgateTimeoutRef.current = null;
+        }
+        webSocketRef.current.send(
+          JSON.stringify({
+            type: "warpgate_auth_continue",
+            data: {},
+          }),
+        );
+        setWarpgateAuthRequired(false);
+        setWarpgateAuthUrl("");
+        setWarpgateSecurityKey("");
+      }
+    }
+
+    function handleWarpgateCancel() {
+      if (warpgateTimeoutRef.current) {
+        clearTimeout(warpgateTimeoutRef.current);
+        warpgateTimeoutRef.current = null;
+      }
+      setWarpgateAuthRequired(false);
+      setWarpgateAuthUrl("");
+      setWarpgateSecurityKey("");
+      if (onClose) onClose();
+    }
+
+    function handleWarpgateOpenUrl() {
+      if (warpgateAuthUrl) {
+        window.open(warpgateAuthUrl, "_blank", "noopener,noreferrer");
+      }
+    }
+
+    function handleAuthDialogSubmit(credentials: {
+      password?: string;
+      sshKey?: string;
+      keyPassword?: string;
+    }) {
+      if (webSocketRef.current && terminal) {
+        webSocketRef.current.send(
+          JSON.stringify({
+            type: "reconnect_with_credentials",
+            data: {
+              cols: terminal.cols,
+              rows: terminal.rows,
+              password: credentials.password,
+              sshKey: credentials.sshKey,
+              keyPassword: credentials.keyPassword,
+              hostConfig: {
+                ...hostConfig,
+                password: credentials.password,
+                key: credentials.sshKey,
+                keyPassword: credentials.keyPassword,
+              },
+            },
+          }),
+        );
+        setShowAuthDialog(false);
+        setIsConnecting(true);
+      }
+    }
+
+    function handleAuthDialogCancel() {
+      setShowAuthDialog(false);
+      if (onClose) onClose();
+    }
+
+    function handlePassphraseSubmit(passphrase: string) {
+      if (webSocketRef.current && terminal) {
+        webSocketRef.current.send(
+          JSON.stringify({
+            type: "reconnect_with_credentials",
+            data: {
+              cols: terminal.cols,
+              rows: terminal.rows,
+              keyPassword: passphrase,
+              hostConfig: {
+                ...hostConfig,
+                keyPassword: passphrase,
+              },
+            },
+          }),
+        );
+        setShowPassphraseDialog(false);
+        setIsConnecting(true);
+      }
+    }
+
+    function handlePassphraseCancel() {
+      setShowPassphraseDialog(false);
+      if (onClose) onClose();
+    }
+
+    function scheduleNotify(cols: number, rows: number) {
+      if (!(cols > 0 && rows > 0)) return;
+      pendingSizeRef.current = { cols, rows };
+      if (notifyTimerRef.current) clearTimeout(notifyTimerRef.current);
+      notifyTimerRef.current = setTimeout(() => {
+        const next = pendingSizeRef.current;
+        const last = lastSentSizeRef.current;
+        if (!next) return;
+        if (last && last.cols === next.cols && last.rows === next.rows) return;
+        if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+          webSocketRef.current.send(
+            JSON.stringify({ type: "resize", data: next }),
+          );
+          lastSentSizeRef.current = next;
+        }
+      }, DEBOUNCE_MS);
+    }
+
+    function formatTerminalOutput(output: string): string {
+      const alternateScreen = updateAlternateScreenMode(
+        output,
+        alternateScreenModeRef.current,
+      );
+      alternateScreenModeRef.current = alternateScreen.isActive;
+
+      const syntaxHighlightingEnabled =
+        hostConfig.terminalConfig?.syntaxHighlighting !== false;
+      if (
+        !syntaxHighlightingEnabled ||
+        alternateScreen.sawSequence ||
+        alternateScreen.isActive
+      ) {
+        return output;
+      }
+
+      return highlightTerminalOutput(
+        output,
+        hostConfig.terminalConfig?.syntaxHighlightingOptions,
+      );
+    }
+
+    useImperativeHandle(
+      ref,
+      () => ({
+        disconnect: () => {
+          isUnmountingRef.current = true;
+          shouldNotReconnectRef.current = true;
+          isReconnectingRef.current = false;
+          if (pingIntervalRef.current) {
+            clearInterval(pingIntervalRef.current);
+            pingIntervalRef.current = null;
+          }
+          if (pongTimeoutRef.current) {
+            clearTimeout(pongTimeoutRef.current);
+            pongTimeoutRef.current = null;
+          }
+          if (reconnectTimeoutRef.current) {
+            clearTimeout(reconnectTimeoutRef.current);
+            reconnectTimeoutRef.current = null;
+          }
+          if (connectionTimeoutRef.current) {
+            clearTimeout(connectionTimeoutRef.current);
+            connectionTimeoutRef.current = null;
+          }
+          if (totpTimeoutRef.current) {
+            clearTimeout(totpTimeoutRef.current);
+            totpTimeoutRef.current = null;
+          }
+          if (warpgateTimeoutRef.current) {
+            clearTimeout(warpgateTimeoutRef.current);
+            warpgateTimeoutRef.current = null;
+          }
+          if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+            webSocketRef.current.send(JSON.stringify({ type: "disconnect" }));
+          }
+          sessionIdRef.current = null;
+          webSocketRef.current?.close();
+          setIsConnected(false);
+          setIsConnecting(false);
+        },
+        reconnect: () => {
+          isUnmountingRef.current = false;
+          shouldNotReconnectRef.current = false;
+          isReconnectingRef.current = false;
+          isConnectingRef.current = false;
+          reconnectAttempts.current = 0;
+          wasDisconnectedBySSH.current = false;
+          wasConnectedRef.current = false;
+          updateConnectionError(null);
+          setShowDisconnectedOverlay(false);
+          if (terminal) {
+            terminal.clear();
+            const cols = terminal.cols;
+            const rows = terminal.rows;
+            connectToHost(cols, rows);
+          }
+        },
+        isConnected: () => isConnected,
+        fit: () => {
+          if (!fitAddonRef.current || !terminal || isFittingRef.current) return;
+          isFittingRef.current = true;
+          try {
+            fitAddonRef.current.fit();
+            if (terminal.cols > 0 && terminal.rows > 0) {
+              const lastSize = lastFittedSizeRef.current;
+              if (
+                !lastSize ||
+                lastSize.cols !== terminal.cols ||
+                lastSize.rows !== terminal.rows
+              ) {
+                scheduleNotify(terminal.cols, terminal.rows);
+                lastFittedSizeRef.current = {
+                  cols: terminal.cols,
+                  rows: terminal.rows,
+                };
+              }
+            }
+            setIsFitted(true);
+          } finally {
+            isFittingRef.current = false;
+          }
+        },
+        focus: () => terminal?.focus(),
+        sendInput: (data: string) => {
+          if (webSocketRef.current?.readyState === 1) {
+            webSocketRef.current.send(JSON.stringify({ type: "input", data }));
+          }
+        },
+        notifyResize: () => {
+          try {
+            const cols = terminal?.cols ?? undefined;
+            const rows = terminal?.rows ?? undefined;
+            if (typeof cols === "number" && typeof rows === "number") {
+              scheduleNotify(cols, rows);
+              hardRefresh();
+            }
+          } catch (error) {
+            console.error("Terminal operation failed:", error);
+          }
+        },
+        refresh: () => hardRefresh(),
+        getApplicationCursorKeysMode: () =>
+          terminal?.modes?.applicationCursorKeysMode ?? false,
+        openFileManager: () => {
+          if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+            webSocketRef.current.send(JSON.stringify({ type: "get_cwd" }));
+          } else {
+            onOpenFileManager?.("/");
+          }
+        },
+      }),
+      [isConnected, terminal],
+    );
+
+    function getUseRightClickCopyPaste() {
+      return getCookie("rightClickCopyPaste") !== "false";
+    }
+
+    function attemptReconnection() {
+      if (
+        isUnmountingRef.current ||
+        shouldNotReconnectRef.current ||
+        isReconnectingRef.current ||
+        isConnectingRef.current ||
+        wasDisconnectedBySSH.current ||
+        reconnectTimeoutRef.current !== null
+      ) {
+        return;
+      }
+
+      if (reconnectAttempts.current >= maxReconnectAttempts) {
+        setIsConnecting(false);
+        shouldNotReconnectRef.current = true;
+        setShowDisconnectedOverlay(true);
+        addLog({
+          type: "error",
+          stage: "connection",
+          message: t("terminal.maxReconnectAttemptsReached"),
+        });
+        return;
+      }
+
+      isReconnectingRef.current = true;
+
+      if (terminal && !isAttachingSessionRef.current) {
+        terminal.clear();
+      }
+
+      reconnectAttempts.current++;
+
+      addLog({
+        type: "info",
+        stage: "connection",
+        message: t("terminal.reconnecting", {
+          attempt: reconnectAttempts.current,
+          max: maxReconnectAttempts,
+        }),
+      });
+
+      const delay = Math.min(
+        2000 * Math.pow(2, reconnectAttempts.current - 1),
+        8000,
+      );
+
+      reconnectTimeoutRef.current = setTimeout(() => {
+        reconnectTimeoutRef.current = null;
+
+        if (
+          isUnmountingRef.current ||
+          shouldNotReconnectRef.current ||
+          wasDisconnectedBySSH.current
+        ) {
+          isReconnectingRef.current = false;
+          return;
+        }
+
+        if (reconnectAttempts.current > maxReconnectAttempts) {
+          isReconnectingRef.current = false;
+          return;
+        }
+
+        if (terminal && hostConfig) {
+          if (!isAttachingSessionRef.current) {
+            terminal.clear();
+          }
+          const cols = terminal.cols;
+          const rows = terminal.rows;
+          connectToHost(cols, rows);
+        }
+
+        isReconnectingRef.current = false;
+      }, delay);
+    }
+
+    async function connectToHost(cols: number, rows: number) {
+      if (isConnectingRef.current) {
+        return;
+      }
+
+      isConnectingRef.current = true;
+      connectionAttemptIdRef.current++;
+      wasConnectedRef.current = false;
+
+      if (!isReconnectingRef.current) {
+        reconnectAttempts.current = 0;
+        shouldNotReconnectRef.current = false;
+      }
+
+      const isDev =
+        !isElectron() &&
+        process.env.NODE_ENV === "development" &&
+        (window.location.port === "3000" ||
+          window.location.port === "5173" ||
+          window.location.port === "");
+
+      let baseWsUrl: string;
+
+      if (isDev) {
+        baseWsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://localhost:30002`;
+      } else if (isElectron()) {
+        let configuredUrl = (window as { configuredServerUrl?: string | null })
+          .configuredServerUrl;
+
+        if (!configuredUrl && !isEmbeddedMode()) {
+          try {
+            const serverConfig = await getServerConfig();
+            configuredUrl = serverConfig?.serverUrl || null;
+            if (configuredUrl) {
+              (
+                window as Window &
+                  typeof globalThis & {
+                    configuredServerUrl?: string | null;
+                  }
+              ).configuredServerUrl = configuredUrl;
+            }
+          } catch (error) {
+            console.error("Failed to resolve Electron server URL:", error);
+          }
+        }
+
+        if (isEmbeddedMode()) {
+          baseWsUrl = "ws://127.0.0.1:30002";
+          const storedJwt = localStorage.getItem("jwt");
+          if (storedJwt) {
+            baseWsUrl += `?token=${encodeURIComponent(storedJwt)}`;
+          }
+        } else if (!configuredUrl) {
+          console.error("No configured server URL available for Electron SSH");
+          setIsConnected(false);
+          setIsConnecting(false);
+          updateConnectionError(t("errors.failedToLoadServer"));
+          isConnectingRef.current = false;
+          return;
+        } else {
+          const wsProtocol = configuredUrl.startsWith("https://")
+            ? "wss://"
+            : "ws://";
+          const wsHost = configuredUrl
+            .replace(/^https?:\/\//, "")
+            .replace(/\/$/, "");
+          baseWsUrl = `${wsProtocol}${wsHost}/ssh/websocket/`;
+          const storedJwt = localStorage.getItem("jwt");
+          if (storedJwt) {
+            baseWsUrl += `?token=${encodeURIComponent(storedJwt)}`;
+          }
+        }
+      } else {
+        baseWsUrl = `${getBasePath()}/ssh/websocket/`;
+      }
+
+      if (
+        webSocketRef.current &&
+        webSocketRef.current.readyState !== WebSocket.CLOSED
+      ) {
+        webSocketRef.current.close();
+      }
+
+      if (pingIntervalRef.current) {
+        clearInterval(pingIntervalRef.current);
+        pingIntervalRef.current = null;
+      }
+      if (connectionTimeoutRef.current) {
+        clearTimeout(connectionTimeoutRef.current);
+        connectionTimeoutRef.current = null;
+      }
+
+      const ws = new WebSocket(baseWsUrl);
+      webSocketRef.current = ws;
+      wasDisconnectedBySSH.current = false;
+      updateConnectionError(null);
+      shouldNotReconnectRef.current = false;
+      isReconnectingRef.current = false;
+      setIsConnecting(true);
+
+      setupWebSocketListeners(ws, cols, rows);
+    }
+
+    function setupWebSocketListeners(
+      ws: WebSocket,
+      cols: number,
+      rows: number,
+    ) {
+      ws.addEventListener("open", () => {
+        // Per socket, which is what the resume site has always claimed: a fresh connection
+        // gets a fresh chance to resume, while within one socket a refused resume falls
+        // through to a new shell instead of being retried. Without this reset the flag was
+        // per TAB — one refused resume, and a transient `ensure_session_live` probe failure
+        // is enough, disabled resuming for the rest of that tab's life, so a later redeploy
+        // silently dropped the operator's screen the feature exists to preserve.
+        //
+        // This cannot ping-pong: `sessionExpired` nulls `sessionIdRef`, so the socket opened
+        // after a refused resume sends `connectFrame` rather than `attachFrame` and never
+        // receives `sessionExpired` again.
+        resumeAttemptedRef.current = false;
+        resumePendingRef.current = false;
+        alternateScreenModeRef.current = false;
+        connectionTimeoutRef.current = setTimeout(() => {
+          if (
+            !isConnected &&
+            !totpRequired &&
+            !isPasswordPrompt &&
+            !connectionErrorRef.current
+          ) {
+            if (terminal) {
+              terminal.clear();
+            }
+            const timeoutMessage = t("terminal.connectionTimeout");
+            updateConnectionError(timeoutMessage);
+            addLog({
+              type: "error",
+              stage: "connection",
+              message: timeoutMessage,
+            });
+            if (webSocketRef.current) {
+              webSocketRef.current.close();
+            }
+            if (reconnectAttempts.current > 0) {
+              attemptReconnection();
+            } else {
+              setIsConnecting(false);
+              shouldNotReconnectRef.current = true;
+            }
+          }
+        }, 35000);
+
+        currentHostIdRef.current = hostConfig.id;
+        currentHostConfigRef.current = hostConfig;
+
+        // Consume the pending restored session ID once; retries get null so they create fresh connections
+        const restoredSessionId = pendingRestoredSessionIdRef.current;
+        pendingRestoredSessionIdRef.current = null;
+
+        if (restoredSessionId) {
+          sessionIdRef.current = restoredSessionId;
+          isAttachingSessionRef.current = true;
+
+          ws.send(
+            attachFrame(
+              {
+                cols,
+                rows,
+                hostConfig: hostConfig as never,
+                // Only if it is a position in THIS session's stream.
+                lastSeq:
+                  lastSeqRef.current?.sessionId === restoredSessionId
+                    ? lastSeqRef.current.seq
+                    : undefined,
+              },
+              restoredSessionId,
+            ),
+          );
+        } else {
+          // A new stream, whose sequence starts at zero. Carrying the old position forward
+          // would have the next reattach ask for a delta against a stream that never existed.
+          isAttachingSessionRef.current = false;
+          lastSeqRef.current = null;
+          ws.send(
+            connectFrame({
+              cols,
+              rows,
+              hostConfig: hostConfig as never,
+              initialPath,
+              executeCommand,
+              tmuxAttachSession,
+            }),
+          );
+        }
+        terminal.onData((data) => {
+          if (data === "\r" || data === "\n") {
+            const currentCmd = getCurrentCommand().trim();
+            const termelixMatch = currentCmd.match(/^termelix\s+(.+)$/);
+            if (termelixMatch && onOpenFileInEditor) {
+              const filePath = termelixMatch[1].trim();
+              trackInput(data);
+              terminal.write("\r\n");
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({
+                    type: "open_file_in_editor",
+                    path: filePath,
+                  }),
+                );
+              }
+              return;
+            }
+          }
+          trackInput(data);
+          ws.send(JSON.stringify({ type: "input", data }));
+        });
+
+        pongReceivedRef.current = true;
+        pingIntervalRef.current = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            if (!pongReceivedRef.current) {
+              console.warn(
+                "[WebSocket] Pong timeout - connection appears dead, closing",
+              );
+              ws.close();
+              return;
+            }
+            pongReceivedRef.current = false;
+            ws.send(JSON.stringify({ type: "ping" }));
+          }
+        }, 30000);
+      });
+
+      ws.addEventListener("message", (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "pong") {
+            pongReceivedRef.current = true;
+            return;
+          }
+          if (msg.type === "data") {
+            // A replay the server could not turn into a delta: the buffer had been trimmed past
+            // where this client was, so what follows is not a continuation of what is on screen.
+            // Appending it would splice two non-adjacent parts of the stream together.
+            if (replayIsReset(msg)) {
+              terminal.clear();
+              terminal.reset();
+            }
+            const seq = frameSeq(msg);
+            if (seq !== null && sessionIdRef.current) {
+              lastSeqRef.current = { sessionId: sessionIdRef.current, seq };
+            }
+            if (typeof msg.data === "string") {
+              if (showAutocompleteRef.current) {
+                showAutocompleteRef.current = false;
+                setShowAutocomplete(false);
+                setAutocompleteSuggestions([]);
+                currentAutocompleteCommand.current = "";
+              }
+
+              terminal.write(formatTerminalOutput(msg.data));
+            } else {
+              const stringData = String(msg.data);
+              terminal.write(formatTerminalOutput(stringData));
+            }
+          } else if (msg.type === "error") {
+            const errorMessage = msg.message || t("terminal.unknownError");
+
+            addLog({
+              type: "error",
+              stage: "connection",
+              message: errorMessage,
+            });
+
+            // Read the pending flag before clearing it: the classification depends on it, and
+            // this frame consumes it either way. See `error-policy.ts` for why the order of
+            // these four cases is what it is — that decision is tested there, against the
+            // server's real message strings.
+            const resumePending = resumePendingRef.current;
+            resumePendingRef.current = false;
+
+            const disposition = classifyErrorFrame(errorMessage, resumePending);
+
+            // The server answers a refused `resumeBinding` with an ordinary error frame and
+            // KEEPS THE SOCKET OPEN (`terminal_socket.ex`, resume_binding/2). Without this
+            // the tab printed the message and sat there: no close, so the close-handler
+            // reconnect never ran, and the auto-connect effect bails on a socket still OPEN.
+            if (disposition === "resume-fallback") {
+              addLog({
+                type: "info",
+                stage: "connection",
+                message: t("terminal.resumeFailedOpeningShell"),
+              });
+              wasSessionExpiredRef.current = true;
+              if (webSocketRef.current) {
+                webSocketRef.current.close();
+              }
+              return;
+            }
+
+            if (disposition === "transient") {
+              updateConnectionError(errorMessage);
+              setIsConnected(false);
+              if (terminal) {
+                terminal.clear();
+              }
+              setIsConnecting(false);
+              wasDisconnectedBySSH.current = false;
+              return;
+            }
+
+            if (disposition === "auth-fatal") {
+              updateConnectionError(errorMessage);
+              setIsConnecting(false);
+              shouldNotReconnectRef.current = true;
+              if (webSocketRef.current) {
+                webSocketRef.current.close();
+              }
+              return;
+            }
+
+            updateConnectionError(errorMessage);
+            setIsConnecting(false);
+          } else if (msg.type === "connected") {
+            opksshFailedRef.current = false;
+            vaultFailedRef.current = false;
+            wasConnectedRef.current = true;
+            setIsConnected(true);
+            setIsConnecting(false);
+            isConnectingRef.current = false;
+            updateConnectionError(null);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (reconnectAttempts.current > 0) {
+              addLog({
+                type: "success",
+                stage: "connection",
+                message: t("terminal.reconnected"),
+              });
+            } else {
+              addLog({
+                type: "success",
+                stage: "connection",
+                message: t("terminal.connected"),
+              });
+            }
+            reconnectAttempts.current = 0;
+            isReconnectingRef.current = false;
+
+            logTerminalActivity();
+
+            setTimeout(async () => {
+              const terminalConfig = {
+                ...DEFAULT_TERMINAL_CONFIG,
+                ...hostConfig.terminalConfig,
+              };
+
+              if (
+                terminalConfig.environmentVariables &&
+                terminalConfig.environmentVariables.length > 0
+              ) {
+                for (const envVar of terminalConfig.environmentVariables) {
+                  if (envVar.key && envVar.value && ws.readyState === 1) {
+                    ws.send(
+                      JSON.stringify({
+                        type: "input",
+                        data: `export ${envVar.key}="${envVar.value}"\n`,
+                      }),
+                    );
+                  }
+                }
+              }
+
+              if (terminalConfig.autoMosh && ws.readyState === 1) {
+                ws.send(
+                  JSON.stringify({
+                    type: "input",
+                    data: terminalConfig.moshCommand + "\n",
+                  }),
+                );
+              }
+            }, 100);
+          } else if (msg.type === "session_ended") {
+            wasDisconnectedBySSH.current = true;
+            setIsConnected(false);
+            setIsConnecting(false);
+            shouldNotReconnectRef.current = true;
+            if (onClose) {
+              onClose();
+            }
+          } else if (msg.type === "disconnected") {
+            wasDisconnectedBySSH.current = true;
+            shouldNotReconnectRef.current = true;
+            setIsConnected(false);
+            setIsConnecting(false);
+            if (msg.graceful) {
+              wasConnectedRef.current = false;
+              if (onClose) onClose();
+            } else if (wasConnectedRef.current) {
+              wasConnectedRef.current = false;
+              setShowDisconnectedOverlay(true);
+            } else if (!connectionErrorRef.current) {
+              updateConnectionError(
+                msg.message || t("terminal.connectionRejected"),
+              );
+            }
+          } else if (msg.type === "totp_required") {
+            setTotpRequired(true);
+            setTotpPrompt(msg.prompt || t("terminal.totpCodeLabel"));
+            setIsPasswordPrompt(false);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (totpTimeoutRef.current) {
+              clearTimeout(totpTimeoutRef.current);
+            }
+            totpTimeoutRef.current = setTimeout(() => {
+              setTotpRequired(false);
+              if (webSocketRef.current) {
+                webSocketRef.current.close();
+              }
+            }, 180000);
+          } else if (msg.type === "totp_retry") {
+            // Existing prompt remains visible while the backend asks for another code.
+          } else if (msg.type === "password_required") {
+            setTotpRequired(true);
+            setTotpPrompt(msg.prompt || t("common.password"));
+            setIsPasswordPrompt(true);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (totpTimeoutRef.current) {
+              clearTimeout(totpTimeoutRef.current);
+            }
+            totpTimeoutRef.current = setTimeout(() => {
+              setTotpRequired(false);
+              if (webSocketRef.current) {
+                webSocketRef.current.close();
+              }
+            }, 180000);
+          } else if (msg.type === "warpgate_auth_required") {
+            setWarpgateAuthRequired(true);
+            setWarpgateAuthUrl(msg.url || "");
+            setWarpgateSecurityKey(msg.securityKey || "N/A");
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (warpgateTimeoutRef.current) {
+              clearTimeout(warpgateTimeoutRef.current);
+            }
+            warpgateTimeoutRef.current = setTimeout(() => {
+              setWarpgateAuthRequired(false);
+              if (webSocketRef.current) {
+                webSocketRef.current.close();
+              }
+            }, 300000);
+          } else if (msg.type === "opkssh_auth_required") {
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (opksshFailedRef.current) {
+              setOpksshDialog(null);
+              if (opksshTimeoutRef.current) {
+                clearTimeout(opksshTimeoutRef.current);
+                opksshTimeoutRef.current = null;
+              }
+              updateConnectionError(t("terminal.opksshAuthFailed"));
+              addLog({
+                type: "error",
+                stage: "auth",
+                message: t("terminal.opksshAuthFailed"),
+              });
+            } else {
+              opksshFailedRef.current = true;
+              if (webSocketRef.current) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "opkssh_start_auth",
+                    data: { hostId: msg.hostId },
+                  }),
+                );
+              }
+            }
+          } else if (msg.type === "vault_auth_required") {
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (vaultFailedRef.current) {
+              setVaultDialog({
+                stage: "error",
+                error: t("terminal.vaultAuthFailed"),
+              });
+              updateConnectionError(t("terminal.vaultAuthFailed"));
+              addLog({
+                type: "error",
+                stage: "auth",
+                message: t("terminal.vaultAuthFailed"),
+              });
+            } else {
+              vaultFailedRef.current = true;
+              webSocketRef.current?.send(
+                JSON.stringify({
+                  type: "vault_start_auth",
+                  data: { hostId: msg.hostId },
+                }),
+              );
+            }
+          } else if (msg.type === "vault_auth_url") {
+            if (connectionErrorRef.current) return;
+            try {
+              vaultPopupRef.current = window.open(
+                msg.url,
+                "termelix-vault-oidc",
+                "width=540,height=720",
+              );
+            } catch {
+              vaultPopupRef.current = null;
+            }
+            setVaultDialog({ stage: "waiting" });
+            if (vaultTimeoutRef.current) clearTimeout(vaultTimeoutRef.current);
+            vaultTimeoutRef.current = setTimeout(() => {
+              setVaultDialog(null);
+              webSocketRef.current?.close();
+            }, 300000);
+          } else if (msg.type === "vault_completed") {
+            if (vaultTimeoutRef.current) {
+              clearTimeout(vaultTimeoutRef.current);
+              vaultTimeoutRef.current = null;
+            }
+            try {
+              vaultPopupRef.current?.close();
+            } catch {
+              // popup may already be closed
+            }
+            setVaultDialog(null);
+            if (webSocketRef.current && terminal) {
+              webSocketRef.current.send(
+                JSON.stringify({
+                  type: "vault_auth_completed",
+                  data: {
+                    hostId: currentHostIdRef.current,
+                    cols: terminal.cols || 80,
+                    rows: terminal.rows || 24,
+                    hostConfig: currentHostConfigRef.current,
+                  },
+                }),
+              );
+            }
+          } else if (msg.type === "vault_error") {
+            if (connectionErrorRef.current) return;
+            vaultFailedRef.current = true;
+            if (vaultTimeoutRef.current) {
+              clearTimeout(vaultTimeoutRef.current);
+              vaultTimeoutRef.current = null;
+            }
+            try {
+              vaultPopupRef.current?.close();
+            } catch {
+              // popup may already be closed
+            }
+            setVaultDialog({ stage: "error", error: msg.error });
+            setIsConnecting(false);
+          } else if (msg.type === "opkssh_status") {
+            if (connectionErrorRef.current) return;
+            if (msg.stage === "chooser") {
+              setOpksshDialog({
+                isOpen: true,
+                authUrl: msg.url || "",
+                requestId: msg.requestId || "",
+                stage: "chooser",
+                providers: msg.providers,
+              });
+              if (opksshTimeoutRef.current) {
+                clearTimeout(opksshTimeoutRef.current);
+              }
+              opksshTimeoutRef.current = setTimeout(() => {
+                setOpksshDialog(null);
+                if (webSocketRef.current) {
+                  webSocketRef.current.close();
+                }
+              }, 300000);
+            } else {
+              setOpksshDialog((prev) =>
+                prev ? { ...prev, stage: msg.stage } : null,
+              );
+            }
+          } else if (msg.type === "opkssh_completed") {
+            if (opksshTimeoutRef.current) {
+              clearTimeout(opksshTimeoutRef.current);
+              opksshTimeoutRef.current = null;
+            }
+            setOpksshDialog(null);
+            if (webSocketRef.current && terminal) {
+              webSocketRef.current.send(
+                JSON.stringify({
+                  type: "opkssh_auth_completed",
+                  data: {
+                    hostId: currentHostIdRef.current,
+                    cols: terminal.cols || 80,
+                    rows: terminal.rows || 24,
+                    hostConfig: currentHostConfigRef.current,
+                  },
+                }),
+              );
+            }
+          } else if (msg.type === "opkssh_error") {
+            if (connectionErrorRef.current) return;
+            opksshFailedRef.current = true;
+            if (opksshDialog) {
+              setOpksshDialog((prev) =>
+                prev ? { ...prev, stage: "error", error: msg.error } : null,
+              );
+            } else {
+              setOpksshDialog({
+                isOpen: true,
+                authUrl: "",
+                requestId: msg.requestId || "",
+                stage: "error",
+                error: msg.error,
+              });
+            }
+            setIsConnecting(false);
+          } else if (msg.type === "opkssh_timeout") {
+            if (connectionErrorRef.current) return;
+            opksshFailedRef.current = true;
+            if (opksshDialog) {
+              setOpksshDialog((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      stage: "error",
+                      error: t("terminal.opksshTimeout"),
+                    }
+                  : null,
+              );
+            } else {
+              setOpksshDialog({
+                isOpen: true,
+                authUrl: "",
+                requestId: msg.requestId || "",
+                stage: "error",
+                error: t("terminal.opksshTimeout"),
+              });
+            }
+            setIsConnecting(false);
+          } else if (msg.type === "opkssh_config_error") {
+            setOpksshDialog({
+              isOpen: true,
+              authUrl: "",
+              requestId: msg.requestId || "",
+              stage: "error",
+              error: msg.instructions || msg.error,
+            });
+          } else if (msg.type === "keyboard_interactive_available") {
+            setKeyboardInteractiveDetected(true);
+            setIsConnecting(false);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+          } else if (msg.type === "auth_method_not_available") {
+            setAuthDialogReason("no_keyboard");
+            setShowAuthDialog(true);
+            setIsConnecting(false);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+          } else if (msg.type === "cwd") {
+            onOpenFileManager?.(msg.path as string);
+          } else if (msg.type === "open_file_in_editor") {
+            onOpenFileInEditor?.(msg.path as string);
+          } else if (msg.type === "passphrase_required") {
+            setShowPassphraseDialog(true);
+            setIsConnecting(false);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+          } else if (msg.type === "host_key_verification_required") {
+            setHostKeyVerification({
+              isOpen: true,
+              scenario: "new",
+              data: msg.data,
+            });
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+          } else if (msg.type === "host_key_changed") {
+            setHostKeyVerification({
+              isOpen: true,
+              scenario: "changed",
+              data: msg.data,
+            });
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+          } else if (msg.type === "sessionCreated") {
+            sessionIdRef.current = msg.sessionId;
+            if (hostConfig.instanceId) {
+              import("@/main-axios").then(({ patchOpenTab }) => {
+                patchOpenTab(hostConfig.instanceId!, {
+                  backendSessionId: msg.sessionId,
+                }).catch(() => {});
+              });
+            }
+          } else if (msg.type === "sessionAttached") {
+            isAttachingSessionRef.current = false;
+            opksshFailedRef.current = false;
+            vaultFailedRef.current = false;
+            wasConnectedRef.current = true;
+            setIsConnected(true);
+            setIsConnecting(false);
+            isConnectingRef.current = false;
+            shouldNotReconnectRef.current = false;
+            updateConnectionError(null);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (reconnectTimeoutRef.current) {
+              clearTimeout(reconnectTimeoutRef.current);
+              reconnectTimeoutRef.current = null;
+            }
+            reconnectAttempts.current = 0;
+            isReconnectingRef.current = false;
+
+            logTerminalActivity();
+
+            addLog({
+              type: "success",
+              stage: "connection",
+              message: t("terminal.reconnected"),
+            });
+          } else if (msg.type === "sessionExpired") {
+            isAttachingSessionRef.current = false;
+            sessionIdRef.current = null;
+            if (hostConfig.instanceId) {
+              import("@/main-axios").then(({ patchOpenTab }) => {
+                patchOpenTab(hostConfig.instanceId!, {
+                  backendSessionId: null,
+                }).catch(() => {});
+              });
+            }
+
+            // The BEAM session this tab remembered is gone — which is what a redeploy looks
+            // like from here. The remote tmux session it was attached to is very likely still
+            // running, so ask for THAT before settling for a brand new shell: closing and
+            // reconnecting means the operator silently loses whatever was on screen.
+            //
+            // One attempt per socket. A binding whose tmux session really is gone answers with
+            // an error, which the `error` handler turns into a fresh shell (it closes the
+            // socket with `wasSessionExpiredRef` set, so the close handler reconnects);
+            // retrying the resume itself would ping-pong.
+            const canResume =
+              serverCanResume(msg) &&
+              !resumeAttemptedRef.current &&
+              typeof hostConfig.id === "number" &&
+              webSocketRef.current?.readyState === WebSocket.OPEN;
+
+            if (canResume) {
+              resumeAttemptedRef.current = true;
+              resumePendingRef.current = true;
+              addLog({
+                type: "info",
+                stage: "connection",
+                message: t("terminal.resumingSession"),
+              });
+              webSocketRef.current!.send(
+                resumeFrame(
+                  {
+                    cols: terminal?.cols || 80,
+                    rows: terminal?.rows || 24,
+                    hostConfig: hostConfig as never,
+                    // No position here, ever. `resumeBinding` is the path taken precisely
+                    // because the old session is gone; the server builds a new one, bound to
+                    // the same tmux, whose stream starts at zero. Any offset the client still
+                    // holds was earned in the stream that died.
+                  },
+                  hostConfig.id as number,
+                ),
+              );
+            } else {
+              wasSessionExpiredRef.current = true;
+              if (webSocketRef.current) {
+                webSocketRef.current.close();
+              }
+            }
+          } else if (msg.type === "bindingResumed") {
+            // Back in the SAME remote tmux session. Whatever was running still is.
+            resumeAttemptedRef.current = false;
+            resumePendingRef.current = false;
+            if (typeof msg.sessionId === "string") {
+              sessionIdRef.current = msg.sessionId;
+              if (hostConfig.instanceId) {
+                import("@/main-axios").then(({ patchOpenTab }) => {
+                  patchOpenTab(hostConfig.instanceId!, {
+                    backendSessionId: msg.sessionId as string,
+                  }).catch(() => {});
+                });
+              }
+            }
+            setIsConnected(true);
+            setIsConnecting(false);
+            addLog({
+              type: "success",
+              stage: "connection",
+              message: t("terminal.sessionResumed"),
+            });
+          } else if (msg.type === "sessionTakenOver") {
+            sessionIdRef.current = null;
+
+            if (terminal) {
+              terminal.clear();
+            }
+            setIsConnected(false);
+            setIsConnecting(true);
+
+            addLog({
+              type: "warning",
+              stage: "connection",
+              message: t("terminal.sessionTakenOver"),
+            });
+
+            const cols = terminal?.cols || 80;
+            const rows = terminal?.rows || 24;
+            connectToHost(cols, rows);
+          } else if (msg.type === "tmux_sessions_available") {
+            setTmuxSessionPicker({
+              sessions: msg.sessions,
+            });
+          } else if (
+            msg.type === "tmux_session_created" ||
+            msg.type === "tmux_session_attached"
+          ) {
+            const sessionName =
+              typeof msg.sessionName === "string" ? msg.sessionName : "";
+            tmuxSessionNameRef.current = sessionName || "(active)";
+            setIsTmuxAttached(true);
+            addLog({
+              type: "info",
+              stage: "connection",
+              message:
+                msg.type === "tmux_session_created"
+                  ? t("terminal.tmuxSessionCreated", {
+                      name: sessionName || "new",
+                    })
+                  : t("terminal.tmuxSessionAttached", {
+                      name: sessionName,
+                    }),
+            });
+          } else if (msg.type === "tmux_unavailable") {
+            setTimeout(() => {
+              toast.warning(t("terminal.tmuxUnavailable"), {
+                duration: 8000,
+              });
+            }, 500);
+            addLog({
+              type: "warning",
+              stage: "connection",
+              message: t("terminal.tmuxUnavailable"),
+            });
+          } else if (msg.type === "tmux_detached") {
+            tmuxSessionNameRef.current = null;
+            setIsTmuxAttached(false);
+            toast.info(t("terminal.tmuxDetached"), { duration: 3000 });
+          } else if (msg.type === "connection_log") {
+            if (msg.data) {
+              addLog({
+                type: msg.data.level || "info",
+                stage: msg.data.stage || "auth",
+                message: msg.data.message,
+                details: msg.data.details,
+              });
+            }
+          }
+        } catch (error) {
+          console.error("WebSocket message handler error:", error);
+        }
+      });
+
+      const currentAttemptId = connectionAttemptIdRef.current;
+
+      ws.addEventListener("close", (event) => {
+        if (currentAttemptId !== connectionAttemptIdRef.current) {
+          return;
+        }
+
+        setIsConnected(false);
+        isConnectingRef.current = false;
+
+        if (pingIntervalRef.current) {
+          clearInterval(pingIntervalRef.current);
+          pingIntervalRef.current = null;
+        }
+
+        if (pongTimeoutRef.current) {
+          clearTimeout(pongTimeoutRef.current);
+          pongTimeoutRef.current = null;
+        }
+
+        if (totpTimeoutRef.current) {
+          clearTimeout(totpTimeoutRef.current);
+          totpTimeoutRef.current = null;
+        }
+
+        // A socket that dies mid-resume must not leave the flag set for the next one.
+        resumePendingRef.current = false;
+
+        if (wasSessionExpiredRef.current) {
+          wasSessionExpiredRef.current = false;
+          const cols = terminal?.cols || 80;
+          const rows = terminal?.rows || 24;
+          connectToHost(cols, rows);
+          return;
+        }
+
+        if (event.code === 1006) {
+          console.warn(
+            "[WebSocket] Abnormal closure detected - attempting reconnection",
+          );
+          addLog({
+            type: "warning",
+            stage: "connection",
+            message: t("terminal.websocketAbnormalClose"),
+          });
+
+          if (wasConnectedRef.current) {
+            attemptReconnection();
+          } else {
+            updateConnectionError(t("terminal.websocketAbnormalClose"));
+            setIsConnecting(false);
+          }
+          return;
+        }
+
+        if (event.code === 1008) {
+          console.error("WebSocket authentication failed:", event.reason);
+          addLog({
+            type: "error",
+            stage: "auth",
+            message: "Authentication failed - please re-login",
+          });
+          updateConnectionError("Authentication failed - please re-login");
+          setIsConnecting(false);
+          shouldNotReconnectRef.current = true;
+
+          return;
+        }
+
+        if (
+          !wasConnectedRef.current &&
+          !isAttachingSessionRef.current &&
+          event.wasClean &&
+          (event.code === 1005 || event.code === 1000)
+        ) {
+          console.error("[WebSocket] Connection rejected by server");
+          addLog({
+            type: "error",
+            stage: "connection",
+            message: t("terminal.connectionRejected"),
+          });
+          updateConnectionError(t("terminal.connectionRejected"));
+          setIsConnecting(false);
+          shouldNotReconnectRef.current = true;
+          return;
+        }
+
+        const shouldAttemptReconnection =
+          !wasDisconnectedBySSH.current &&
+          !isUnmountingRef.current &&
+          !shouldNotReconnectRef.current &&
+          !isConnectingRef.current;
+
+        if (shouldAttemptReconnection) {
+          wasDisconnectedBySSH.current = false;
+          attemptReconnection();
+        } else {
+          setIsConnecting(false);
+        }
+      });
+
+      ws.addEventListener("error", (event) => {
+        if (currentAttemptId !== connectionAttemptIdRef.current) {
+          return;
+        }
+
+        console.error("[WebSocket] Error:", event);
+
+        setIsConnected(false);
+        isConnectingRef.current = false;
+        updateConnectionError(t("terminal.websocketError"));
+        if (terminal) {
+          terminal.clear();
+        }
+        setIsConnecting(false);
+
+        if (pingIntervalRef.current) {
+          clearInterval(pingIntervalRef.current);
+          pingIntervalRef.current = null;
+        }
+
+        if (totpTimeoutRef.current) {
+          clearTimeout(totpTimeoutRef.current);
+          totpTimeoutRef.current = null;
+        }
+      });
+    }
+
+    async function writeTextToClipboard(text: string): Promise<boolean> {
+      const ok = await copyToClipboard(text);
+      if (!ok) toast.error(t("terminal.clipboardWriteFailed"));
+      return ok;
+    }
+
+    async function readTextFromClipboard(): Promise<string> {
+      try {
+        if (window.electronClipboard) {
+          return window.electronClipboard.readText();
+        }
+        if (navigator.clipboard && navigator.clipboard.readText) {
+          return await navigator.clipboard.readText();
+        }
+      } catch {
+        // fall through
+      }
+      if (window.location.protocol !== "https:" && !isElectron()) {
+        toast.error(t("terminal.clipboardHttpWarning"));
+      }
+      return "";
+    }
+
+    const handleSelectCommand = useCallback(
+      (command: string) => {
+        if (!terminal || !webSocketRef.current) return;
+
+        for (const char of command) {
+          webSocketRef.current.send(
+            JSON.stringify({ type: "input", data: char }),
+          );
+        }
+
+        setTimeout(() => {
+          terminal.focus();
+        }, 100);
+      },
+      [terminal],
+    );
+
+    useEffect(() => {
+      commandHistoryContext.setOnSelectCommand(handleSelectCommand);
+    }, [handleSelectCommand]);
+
+    const handleAutocompleteSelect = useCallback(
+      (selectedCommand: string) => {
+        if (!webSocketRef.current) return;
+
+        const currentCmd = currentAutocompleteCommand.current;
+        const completion = selectedCommand.substring(currentCmd.length);
+
+        for (const char of completion) {
+          webSocketRef.current.send(
+            JSON.stringify({ type: "input", data: char }),
+          );
+        }
+
+        updateCurrentCommand(selectedCommand);
+
+        setShowAutocomplete(false);
+        setAutocompleteSuggestions([]);
+        currentAutocompleteCommand.current = "";
+
+        setTimeout(() => {
+          terminal?.focus();
+        }, 50);
+      },
+      [terminal, updateCurrentCommand],
+    );
+
+    const handleDeleteCommand = useCallback(
+      async (command: string) => {
+        if (!hostConfig.id) return;
+
+        try {
+          await deleteCommandFromHistory(hostConfig.id, command);
+
+          setCommandHistory((prev) => {
+            const newHistory = prev.filter((cmd) => cmd !== command);
+            setCommandHistoryContextRef.current(newHistory);
+            return newHistory;
+          });
+
+          autocompleteHistory.current = autocompleteHistory.current.filter(
+            (cmd) => cmd !== command,
+          );
+        } catch (error) {
+          console.error("Failed to delete command from history:", error);
+        }
+      },
+      [hostConfig.id],
+    );
+
+    useEffect(() => {
+      commandHistoryContext.setOnDeleteCommand(handleDeleteCommand);
+    }, [handleDeleteCommand]);
+
+    // Separate theme and options updates to avoid terminal re-initialization flashes
+    useEffect(() => {
+      if (!terminal) return;
+
+      const config = {
+        ...DEFAULT_TERMINAL_CONFIG,
+        ...hostConfig.terminalConfig,
+      };
+
+      const activeTheme = previewTheme || config.theme;
+      const themeColors = resolveTermelixThemeColors(
+        activeTheme,
+        appTheme,
+        config.customThemeColors,
+      );
+
+      const fontConfig = TERMINAL_FONTS.find(
+        (f) => f.value === config.fontFamily,
+      );
+      const fontFamily = fontConfig?.fallback || TERMINAL_FONTS[0].fallback;
+
+      // Update terminal options individually to avoid re-initialization flashes
+      terminal.options.cursorBlink = config.cursorBlink;
+      terminal.options.cursorStyle = config.cursorStyle;
+      terminal.options.scrollback = config.scrollback;
+      terminal.options.fontSize = config.fontSize;
+      terminalFontSizeRef.current = config.fontSize;
+      terminal.options.fontFamily = fontFamily;
+      terminal.options.rightClickSelectsWord = config.rightClickSelectsWord;
+      terminal.options.fastScrollSensitivity = config.fastScrollSensitivity;
+      terminal.options.minimumContrastRatio = config.minimumContrastRatio;
+      terminal.options.letterSpacing = config.letterSpacing;
+      terminal.options.lineHeight = config.lineHeight;
+      // NOT an xterm option since v5 — assigning it here did nothing at all. The bell is
+      // implemented in `attachBell`, which reads this ref when a bell actually arrives, so a
+      // change in the host editor applies to the open terminal.
+      bellStyleRef.current = config.bellStyle as BellStyle;
+
+      terminal.options.theme = {
+        background: config.backgroundImage
+          ? "transparent"
+          : themeColors.background,
+        foreground: themeColors.foreground,
+        cursor: themeColors.cursor,
+        cursorAccent: themeColors.cursorAccent,
+        selectionBackground: themeColors.selectionBackground,
+        selectionForeground: themeColors.selectionForeground,
+        black: themeColors.black,
+        red: themeColors.red,
+        green: themeColors.green,
+        yellow: themeColors.yellow,
+        blue: themeColors.blue,
+        magenta: themeColors.magenta,
+        cyan: themeColors.cyan,
+        white: themeColors.white,
+        brightBlack: themeColors.brightBlack,
+        brightRed: themeColors.brightRed,
+        brightGreen: themeColors.brightGreen,
+        brightYellow: themeColors.brightYellow,
+        brightBlue: themeColors.brightBlue,
+        brightMagenta: themeColors.brightMagenta,
+        brightCyan: themeColors.brightCyan,
+        brightWhite: themeColors.brightWhite,
+      };
+
+      // Ensure terminal is correctly fitted if font-related options change
+      if (fitAddonRef.current && isFitted) {
+        performFit();
+      }
+
+      // Refresh terminal to apply new theme colors to existing buffer content
+      hardRefresh();
+    }, [terminal, hostConfig.terminalConfig, previewTheme, appTheme, isFitted]);
+
+    useEffect(() => {
+      if (!terminal || !xtermRef.current) return;
+
+      const config = {
+        ...DEFAULT_TERMINAL_CONFIG,
+        ...hostConfig.terminalConfig,
+      };
+
+      const fontConfig = TERMINAL_FONTS.find(
+        (f) => f.value === config.fontFamily,
+      );
+      const fontFamily = fontConfig?.fallback || TERMINAL_FONTS[0].fallback;
+
+      const activeTheme = previewTheme || config.theme;
+      const themeColors = resolveTermelixThemeColors(
+        activeTheme,
+        appTheme,
+        config.customThemeColors,
+      );
+
+      // Set initial options before opening the terminal
+      terminal.options = {
+        cursorBlink: config.cursorBlink,
+        cursorStyle: config.cursorStyle,
+        scrollback: config.scrollback,
+        fontSize: config.fontSize,
+        fontFamily,
+        allowTransparency: true, // MUST be set before open()
+        convertEol: false,
+        macOptionIsMeta: true,
+        macOptionClickForcesSelection: false,
+        rightClickSelectsWord: config.rightClickSelectsWord,
+        fastScrollSensitivity: config.fastScrollSensitivity,
+        allowProposedApi: true,
+        minimumContrastRatio: config.minimumContrastRatio,
+        letterSpacing: config.letterSpacing,
+        lineHeight: config.lineHeight,
+        theme: {
+          background: config.backgroundImage
+            ? "transparent"
+            : themeColors.background,
+          foreground: themeColors.foreground,
+          cursor: themeColors.cursor,
+          cursorAccent: themeColors.cursorAccent,
+          selectionBackground: themeColors.selectionBackground,
+          selectionForeground: themeColors.selectionForeground,
+          black: themeColors.black,
+          red: themeColors.red,
+          green: themeColors.green,
+          yellow: themeColors.yellow,
+          blue: themeColors.blue,
+          magenta: themeColors.magenta,
+          cyan: themeColors.cyan,
+          white: themeColors.white,
+          brightBlack: themeColors.brightBlack,
+          brightRed: themeColors.brightRed,
+          brightGreen: themeColors.brightGreen,
+          brightYellow: themeColors.brightYellow,
+          brightBlue: themeColors.brightBlue,
+          brightMagenta: themeColors.brightMagenta,
+          brightCyan: themeColors.brightCyan,
+          brightWhite: themeColors.brightWhite,
+        },
+      };
+
+      const fitAddon = new FitAddon();
+      const clipboardProvider = new RobustClipboardProvider();
+      const clipboardAddon = new ClipboardAddon(undefined, clipboardProvider);
+      const unicode11Addon = new Unicode11Addon();
+      const webLinksAddon = new WebLinksAddon((_event, uri) => {
+        const url =
+          uri.startsWith("http://") || uri.startsWith("https://")
+            ? uri
+            : `https://${uri}`;
+
+        const hostBehavior = hostConfig.terminalConfig?.linkClickBehavior;
+        const globalBehavior =
+          localStorage.getItem("terminalLinkClickBehavior") ?? "confirm";
+        const behavior = hostBehavior ?? globalBehavior;
+
+        if (behavior === "direct") {
+          window.open(url, "_blank");
+        } else {
+          setLinkClickDialog({ url });
+        }
+      });
+
+      fitAddonRef.current = fitAddon;
+      terminal.loadAddon(fitAddon);
+      terminal.loadAddon(clipboardAddon);
+      terminal.loadAddon(unicode11Addon);
+      terminal.loadAddon(webLinksAddon);
+
+      terminal.unicode.activeVersion = "11";
+
+      terminal.open(xtermRef.current);
+
+      const detachBell = attachBell(
+        terminal,
+        xtermRef.current,
+        () => bellStyleRef.current,
+      );
+
+      const xtermTextarea = xtermRef.current.querySelector("textarea");
+      if (xtermTextarea) {
+        xtermTextarea.setAttribute("autocomplete", "off");
+        xtermTextarea.setAttribute("autocorrect", "off");
+        xtermTextarea.setAttribute("autocapitalize", "none");
+        xtermTextarea.setAttribute("spellcheck", "false");
+        xtermTextarea.setAttribute("data-gramm", "false");
+        xtermTextarea.setAttribute("data-gramm_editor", "false");
+        xtermTextarea.setAttribute("data-enable-grammarly", "false");
+      }
+
+      terminal.onTitleChange((title) => {
+        if (title) onTitleChange?.(title);
+      });
+      document.fonts.ready.then(() => {
+        terminal.refresh(0, terminal.rows - 1);
+        fitAddon.fit();
+      });
+
+      terminal.attachCustomWheelEventHandler((ev) => {
+        if (ev.ctrlKey || ev.metaKey) {
+          changeTerminalFontSize(ev.deltaY < 0 ? 1 : -1);
+          return false;
+        }
+
+        const cfg = {
+          ...DEFAULT_TERMINAL_CONFIG,
+          ...hostConfig.terminalConfig,
+        };
+        const mod = cfg.fastScrollModifier;
+        const modHeld =
+          (mod === "alt" && ev.altKey) ||
+          (mod === "ctrl" && ev.ctrlKey) ||
+          (mod === "shift" && ev.shiftKey);
+        if (modHeld) {
+          const lines = Math.round(
+            (Math.abs(ev.deltaY) / 100) * (cfg.fastScrollSensitivity ?? 5),
+          );
+          terminal.scrollLines(ev.deltaY > 0 ? lines : -lines);
+          return false;
+        }
+        return true;
+      });
+
+      fitAddonRef.current?.fit();
+      // Double-rAF ensures layout is fully settled (fonts, flexbox, etc.) before
+      // committing the fitted size, preventing the "terminal too short" glitch.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          fitAddonRef.current?.fit();
+          setIsFitted(true);
+        });
+      });
+
+      const element = xtermRef.current;
+      const handleContextMenu = (e: MouseEvent) => {
+        if (e.ctrlKey && onOpenFileManager) {
+          e.preventDefault();
+          e.stopPropagation();
+          onOpenFileManager();
+          return;
+        }
+
+        if (getUseRightClickCopyPaste()) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (terminal.hasSelection()) {
+            const text = terminal.getSelection();
+            writeTextToClipboard(text).then(() => terminal.clearSelection());
+          } else {
+            readTextFromClipboard().then((text) => {
+              if (text) terminal.paste(text);
+            });
+          }
+          return;
+        }
+      };
+      element?.addEventListener("contextmenu", handleContextMenu);
+
+      const handlePaste = (e: ClipboardEvent) => {
+        const text = e.clipboardData?.getData("text");
+        if (text) {
+          e.preventDefault();
+          e.stopPropagation();
+          terminal.paste(text);
+        }
+      };
+      element?.addEventListener("paste", handlePaste);
+
+      let tmuxDragTracking = false;
+      const handleTmuxDragStart = (e: MouseEvent) => {
+        if (e.button !== 0) return;
+        if (!tmuxSessionNameRef.current) return;
+        tmuxDragTracking = true;
+      };
+      const handleTmuxDragMove = () => {
+        if (!tmuxDragTracking) return;
+        tmuxDragTracking = false;
+        if (tmuxCopyModeHintShownRef.current) return;
+        tmuxCopyModeHintShownRef.current = true;
+        toast.info(t("terminal.tmuxCopyHint"), { duration: 5000 });
+      };
+      const handleTmuxDragEnd = () => {
+        tmuxDragTracking = false;
+      };
+      element?.addEventListener("mousedown", handleTmuxDragStart);
+      element?.addEventListener("mousemove", handleTmuxDragMove);
+      element?.addEventListener("mouseup", handleTmuxDragEnd);
+
+      const handleBackspaceMode = (e: KeyboardEvent) => {
+        if (e.key !== "Backspace") return;
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+        const config = {
+          ...DEFAULT_TERMINAL_CONFIG,
+          ...hostConfig.terminalConfig,
+        };
+        if (config.backspaceMode !== "control-h") return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        if (webSocketRef.current?.readyState === 1) {
+          webSocketRef.current.send(
+            JSON.stringify({ type: "input", data: "\x08" }),
+          );
+        }
+        return false;
+      };
+
+      // On macOS Electron, Tab key events can be swallowed by Chromium's focus
+      // traversal system before xterm.js sees them. Calling preventDefault() in
+      // the capture phase blocks that traversal while still allowing the event to
+      // reach xterm.js's internal handler (which fires our attachCustomKeyEventHandler).
+      const handleTabCapture = (e: KeyboardEvent) => {
+        if (e.key === "Tab") {
+          e.preventDefault();
+        }
+      };
+
+      element?.addEventListener("keydown", handleBackspaceMode, true);
+      element?.addEventListener("keydown", handleTabCapture, true);
+
+      const resizeObserver = new ResizeObserver(() => {
+        // Background keep-alive tabs still observe layout; skip fit work.
+        if (!isVisibleRef.current) return;
+        if (resizeTimeout.current) clearTimeout(resizeTimeout.current);
+        resizeTimeout.current = setTimeout(() => {
+          if (isVisibleRef.current) {
+            performFit();
+          }
+        }, 50);
+      });
+
+      const observeTarget = xtermRef.current.parentElement ?? xtermRef.current;
+      resizeObserver.observe(observeTarget);
+
+      return () => {
+        isFittingRef.current = false;
+        detachBell();
+        resizeObserver.disconnect();
+        clipboardProvider.dispose();
+        element?.removeEventListener("contextmenu", handleContextMenu);
+        element?.removeEventListener("paste", handlePaste);
+        element?.removeEventListener("mousedown", handleTmuxDragStart);
+        element?.removeEventListener("mousemove", handleTmuxDragMove);
+        element?.removeEventListener("mouseup", handleTmuxDragEnd);
+        element?.removeEventListener("keydown", handleBackspaceMode, true);
+        element?.removeEventListener("keydown", handleTabCapture, true);
+        if (notifyTimerRef.current) clearTimeout(notifyTimerRef.current);
+        if (resizeTimeout.current) clearTimeout(resizeTimeout.current);
+      };
+    }, [xtermRef, terminal]);
+
+    const isMountedRef = useRef(false);
+
+    useEffect(() => {
+      isMountedRef.current = true;
+
+      const currentHostId = hostConfig.id;
+      return () => {
+        if (!isMountedRef.current) {
+          return;
+        }
+
+        if (
+          currentHostIdRef.current !== currentHostId &&
+          currentHostIdRef.current !== null
+        ) {
+          isUnmountingRef.current = true;
+          shouldNotReconnectRef.current = true;
+          isReconnectingRef.current = false;
+          setIsConnecting(false);
+          if (reconnectTimeoutRef.current)
+            clearTimeout(reconnectTimeoutRef.current);
+          if (connectionTimeoutRef.current)
+            clearTimeout(connectionTimeoutRef.current);
+          if (totpTimeoutRef.current) clearTimeout(totpTimeoutRef.current);
+          if (pingIntervalRef.current) {
+            clearInterval(pingIntervalRef.current);
+            pingIntervalRef.current = null;
+          }
+          if (pongTimeoutRef.current) {
+            clearTimeout(pongTimeoutRef.current);
+            pongTimeoutRef.current = null;
+          }
+
+          if (webSocketRef.current) {
+            webSocketRef.current.close();
+          }
+
+          isMountedRef.current = false;
+        }
+      };
+    }, [hostConfig.id, hostConfig.instanceId]);
+
+    useEffect(() => {
+      if (!terminal) return;
+
+      const handleCustomKey = (e: KeyboardEvent): boolean => {
+        if (e.type !== "keydown") {
+          return true;
+        }
+
+        // Forward global app shortcuts to AppShell directly — xterm swallows
+        // all keydown events and synthetic re-dispatch is unreliable.
+        // stopPropagation prevents the same event from also firing the window listener.
+        if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
+          const globalCodes = [
+            "BracketRight",
+            "BracketLeft",
+            "Backslash",
+            "Minus",
+          ];
+          if (globalCodes.includes(e.code)) {
+            e.stopPropagation();
+            globalShortcutHandler.current?.(e);
+            return false;
+          }
+        }
+
+        if (e.altKey && !e.ctrlKey && !e.shiftKey && !e.metaKey) {
+          const arrowCodes = [
+            "ArrowLeft",
+            "ArrowRight",
+            "ArrowUp",
+            "ArrowDown",
+          ];
+          if (arrowCodes.includes(e.code)) {
+            e.stopPropagation();
+            globalShortcutHandler.current?.(e);
+            return false;
+          }
+        }
+
+        const fontZoomDirection = getTerminalFontZoomDirection(e);
+        if (fontZoomDirection !== 0) {
+          e.preventDefault();
+          e.stopPropagation();
+          changeTerminalFontSize(fontZoomDirection);
+          return false;
+        }
+
+        if (
+          e.ctrlKey &&
+          !e.shiftKey &&
+          !e.altKey &&
+          !e.metaKey &&
+          e.key.toLowerCase() === "c" &&
+          terminal.hasSelection()
+        ) {
+          const selection = terminal.getSelection();
+          if (selection) {
+            e.preventDefault();
+            e.stopPropagation();
+            writeTextToClipboard(selection);
+            terminal.clearSelection();
+            return false;
+          }
+        }
+
+        if (
+          ((e.metaKey && !e.shiftKey && !e.ctrlKey && !e.altKey) ||
+            (e.ctrlKey &&
+              !e.shiftKey &&
+              !e.altKey &&
+              !e.metaKey &&
+              e.key === "Insert")) &&
+          (e.key.toLowerCase() === "c" || e.key === "Insert")
+        ) {
+          const selection = terminal.getSelection();
+          if (selection) {
+            e.preventDefault();
+            e.stopPropagation();
+            writeTextToClipboard(selection);
+            return false;
+          }
+        }
+
+        if (
+          e.ctrlKey &&
+          e.shiftKey &&
+          !e.altKey &&
+          !e.metaKey &&
+          e.key.toLowerCase() === "c"
+        ) {
+          const selection = terminal.getSelection();
+          if (selection) {
+            e.preventDefault();
+            e.stopPropagation();
+            writeTextToClipboard(selection);
+            terminal.clearSelection();
+            return false;
+          }
+        }
+
+        if (
+          e.ctrlKey &&
+          e.shiftKey &&
+          !e.altKey &&
+          !e.metaKey &&
+          e.key.toLowerCase() === "v"
+        ) {
+          e.preventDefault();
+          e.stopPropagation();
+          readTextFromClipboard().then((text) => {
+            if (text) terminal.paste(text);
+          });
+          return false;
+        }
+
+        if (
+          e.ctrlKey &&
+          !e.shiftKey &&
+          !e.altKey &&
+          !e.metaKey &&
+          e.key.toLowerCase() === "v"
+        ) {
+          // Let the browser handle Ctrl+V natively, the paste event
+          // listener will intercept the result without triggering the
+          // clipboard permission popup
+          return false;
+        }
+
+        if (e.ctrlKey && e.altKey && !e.metaKey && !e.shiftKey) {
+          const key = e.key.toLowerCase();
+          const blockedKeys = ["w", "t", "n", "q"];
+          if (blockedKeys.includes(key)) {
+            e.preventDefault();
+            e.stopPropagation();
+            const ctrlCode = key.charCodeAt(0) - 96;
+            if (webSocketRef.current?.readyState === 1) {
+              webSocketRef.current.send(
+                JSON.stringify({
+                  type: "input",
+                  data: String.fromCharCode(ctrlCode),
+                }),
+              );
+            }
+            return false;
+          }
+        }
+
+        if (showAutocompleteRef.current) {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            setShowAutocomplete(false);
+            setAutocompleteSuggestions([]);
+            currentAutocompleteCommand.current = "";
+            return false;
+          }
+
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const currentIndex = autocompleteSelectedIndexRef.current;
+            const suggestionsLength = autocompleteSuggestionsRef.current.length;
+
+            if (e.key === "ArrowDown") {
+              const newIndex =
+                currentIndex < suggestionsLength - 1 ? currentIndex + 1 : 0;
+              setAutocompleteSelectedIndex(newIndex);
+            } else if (e.key === "ArrowUp") {
+              const newIndex =
+                currentIndex > 0 ? currentIndex - 1 : suggestionsLength - 1;
+              setAutocompleteSelectedIndex(newIndex);
+            }
+            return false;
+          }
+
+          if (
+            e.key === "Enter" &&
+            autocompleteSuggestionsRef.current.length > 0
+          ) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const selectedCommand =
+              autocompleteSuggestionsRef.current[
+                autocompleteSelectedIndexRef.current
+              ];
+            const currentCmd = currentAutocompleteCommand.current;
+            const completion = selectedCommand.substring(currentCmd.length);
+
+            if (webSocketRef.current?.readyState === 1) {
+              for (const char of completion) {
+                webSocketRef.current.send(
+                  JSON.stringify({ type: "input", data: char }),
+                );
+              }
+            }
+
+            updateCurrentCommandRef.current(selectedCommand);
+
+            setShowAutocomplete(false);
+            setAutocompleteSuggestions([]);
+            currentAutocompleteCommand.current = "";
+
+            return false;
+          }
+
+          if (
+            e.key === "Tab" &&
+            !e.ctrlKey &&
+            !e.altKey &&
+            !e.metaKey &&
+            !e.shiftKey
+          ) {
+            e.preventDefault();
+            e.stopPropagation();
+            const currentIndex = autocompleteSelectedIndexRef.current;
+            const suggestionsLength = autocompleteSuggestionsRef.current.length;
+            const newIndex =
+              currentIndex < suggestionsLength - 1 ? currentIndex + 1 : 0;
+            setAutocompleteSelectedIndex(newIndex);
+            return false;
+          }
+
+          setShowAutocomplete(false);
+          setAutocompleteSuggestions([]);
+          currentAutocompleteCommand.current = "";
+          return true;
+        }
+
+        if (
+          e.key === "Tab" &&
+          e.shiftKey &&
+          !e.ctrlKey &&
+          !e.altKey &&
+          !e.metaKey
+        ) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (webSocketRef.current?.readyState === 1) {
+            webSocketRef.current.send(
+              JSON.stringify({ type: "input", data: "\x1b[Z" }),
+            );
+          }
+          return false;
+        }
+
+        if (
+          e.key === "Tab" &&
+          !e.ctrlKey &&
+          !e.altKey &&
+          !e.metaKey &&
+          !e.shiftKey
+        ) {
+          e.preventDefault();
+          e.stopPropagation();
+
+          const sendTabToShell = () => {
+            if (webSocketRef.current?.readyState === 1) {
+              webSocketRef.current.send(
+                JSON.stringify({ type: "input", data: "\t" }),
+              );
+            }
+          };
+
+          const autocompleteEnabled =
+            localStorage.getItem("commandAutocomplete") === "true";
+
+          if (!autocompleteEnabled) {
+            sendTabToShell();
+            return false;
+          }
+
+          const currentCmd = getCurrentCommandRef.current().trim();
+          if (currentCmd.length === 0) {
+            sendTabToShell();
+            return false;
+          }
+
+          if (webSocketRef.current?.readyState === 1) {
+            const matches = autocompleteHistory.current
+              .filter(
+                (cmd) =>
+                  cmd.startsWith(currentCmd) &&
+                  cmd !== currentCmd &&
+                  cmd.length > currentCmd.length,
+              )
+              .slice(0, 5);
+
+            if (matches.length === 1) {
+              const completedCommand = matches[0];
+              const completion = completedCommand.substring(currentCmd.length);
+
+              for (const char of completion) {
+                webSocketRef.current.send(
+                  JSON.stringify({ type: "input", data: char }),
+                );
+              }
+
+              updateCurrentCommandRef.current(completedCommand);
+            } else if (matches.length > 1) {
+              currentAutocompleteCommand.current = currentCmd;
+              setAutocompleteSuggestions(matches);
+              setAutocompleteSelectedIndex(0);
+
+              const cursorY = terminal.buffer.active.cursorY;
+              const cursorX = terminal.buffer.active.cursorX;
+              const rect = xtermRef.current?.getBoundingClientRect();
+
+              if (rect) {
+                const cellHeight =
+                  terminal.rows > 0 ? rect.height / terminal.rows : 20;
+                const cellWidth =
+                  terminal.cols > 0 ? rect.width / terminal.cols : 10;
+
+                const itemHeight = 32;
+                const footerHeight = 32;
+                const maxMenuHeight = 240;
+                const estimatedMenuHeight = Math.min(
+                  matches.length * itemHeight + footerHeight,
+                  maxMenuHeight,
+                );
+                const cursorBottomY = rect.top + (cursorY + 1) * cellHeight;
+                const cursorTopY = rect.top + cursorY * cellHeight;
+                const spaceBelow = window.innerHeight - cursorBottomY;
+                const spaceAbove = cursorTopY;
+
+                const showAbove =
+                  spaceBelow < estimatedMenuHeight && spaceAbove > spaceBelow;
+
+                setAutocompletePosition({
+                  top: showAbove
+                    ? Math.max(0, cursorTopY - estimatedMenuHeight)
+                    : cursorBottomY,
+                  left: Math.max(0, rect.left + cursorX * cellWidth),
+                });
+              }
+
+              setShowAutocomplete(true);
+            } else {
+              sendTabToShell();
+            }
+          }
+          return false;
+        }
+
+        return true;
+      };
+
+      terminal.attachCustomKeyEventHandler(handleCustomKey);
+    }, [terminal]);
+
+    useEffect(() => {
+      if (!terminal || !hostConfig || !isVisible) return;
+      if (isConnected || isConnecting) return;
+
+      if (isReconnectingRef.current || reconnectTimeoutRef.current !== null) {
+        return;
+      }
+
+      if (shouldNotReconnectRef.current) {
+        return;
+      }
+
+      if (
+        webSocketRef.current &&
+        (webSocketRef.current.readyState === WebSocket.OPEN ||
+          webSocketRef.current.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
+
+      setIsConnecting(true);
+      fitAddonRef.current?.fit();
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          fitAddonRef.current?.fit();
+          if (terminal.cols > 0 && terminal.rows > 0) {
+            scheduleNotify(terminal.cols, terminal.rows);
+            connectToHost(terminal.cols, terminal.rows);
+          }
+        });
+      });
+    }, [terminal, hostConfig.id, isVisible, isConnected, isConnecting]);
+
+    useEffect(() => {
+      if (!terminal || !fitAddonRef.current) return;
+
+      if (!isVisible) {
+        lastFittedSizeRef.current = null;
+        lastSentSizeRef.current = null;
+        return;
+      }
+
+      const fitTimeoutId = setTimeout(() => {
+        if (!isFittingRef.current && terminal.cols > 0 && terminal.rows > 0) {
+          performFit();
+          if (!splitScreen && !isConnecting && !disableAutoFocus) {
+            requestAnimationFrame(() => terminal.focus());
+          }
+        }
+      }, 50);
+
+      return () => clearTimeout(fitTimeoutId);
+    }, [terminal, isVisible, splitScreen, isConnecting]);
+
+    const hasConnectionError = !!connectionError;
+
+    return (
+      <div
+        className="h-full w-full relative"
+        style={{
+          backgroundColor: backgroundImage ? "transparent" : backgroundColor,
+          ...(backgroundImage && {
+            backgroundImage: `url(${backgroundImage})`,
+            backgroundSize: "cover",
+            backgroundPosition: "center",
+            backgroundRepeat: "no-repeat",
+          }),
+        }}
+      >
+        {backgroundImage && (
+          <div
+            className="absolute inset-0 pointer-events-none"
+            style={{
+              backgroundColor: themeColors.background,
+              opacity: 1 - backgroundImageOpacity,
+            }}
+          />
+        )}
+        <div
+          ref={xtermRef}
+          className="h-full w-full relative"
+          style={{
+            pointerEvents: isVisible ? "auto" : "none",
+            visibility:
+              isConnected && isFitted && !connectionError
+                ? "visible"
+                : "hidden",
+          }}
+          onClick={() => {
+            if (terminal && !splitScreen) {
+              terminal.focus();
+            }
+          }}
+        />
+
+        {isTmuxAttached && isConnected && (
+          <button
+            onClick={() => {
+              if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+                webSocketRef.current.send(
+                  JSON.stringify({ type: "tmux_detach" }),
+                );
+              }
+            }}
+            title={t("terminal.tmuxDetach")}
+            className="absolute top-2 right-2 z-[110] px-2 py-1 text-xs rounded bg-black/60 text-white/70 hover:text-white hover:bg-black/80 transition-colors"
+          >
+            tmux:detach
+          </button>
+        )}
+
+        <SimpleLoader
+          visible={isConnecting && !isConnectionLogExpanded}
+          message={t("terminal.connecting")}
+          backgroundColor={backgroundColor}
+        />
+
+        {showDisconnectedOverlay && !isConnecting && (
+          <div
+            className="absolute inset-0 flex flex-col items-center justify-center gap-3 z-[120]"
+            style={{ backgroundColor }}
+          >
+            <p className="text-sm text-muted-foreground">
+              {t("terminal.connectionLost")}
+            </p>
+            <div className="flex gap-2">
+              <Button
+                onClick={() => {
+                  setShowDisconnectedOverlay(false);
+                  isUnmountingRef.current = false;
+                  shouldNotReconnectRef.current = false;
+                  isReconnectingRef.current = false;
+                  isConnectingRef.current = false;
+                  reconnectAttempts.current = 0;
+                  wasDisconnectedBySSH.current = false;
+                  wasConnectedRef.current = false;
+                  updateConnectionError(null);
+                  if (terminal) {
+                    terminal.clear();
+                    connectToHost(terminal.cols, terminal.rows);
+                  }
+                }}
+              >
+                {t("terminal.reconnect")}
+              </Button>
+              {onClose && (
+                <Button variant="outline" onClick={onClose}>
+                  {t("terminal.closeTab")}
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
+
+        <ConnectionLog
+          isConnecting={isConnecting}
+          isConnected={isConnected}
+          hasConnectionError={hasConnectionError && !showDisconnectedOverlay}
+          position={hasConnectionError ? "top" : "bottom"}
+        />
+
+        <TOTPDialog
+          isOpen={totpRequired}
+          prompt={totpPrompt}
+          onSubmit={handleTotpSubmit}
+          onCancel={handleTotpCancel}
+          backgroundColor={backgroundColor}
+        />
+
+        <SSHAuthDialog
+          isOpen={showAuthDialog}
+          reason={authDialogReason}
+          onSubmit={handleAuthDialogSubmit}
+          onCancel={handleAuthDialogCancel}
+          hostInfo={{
+            ip: hostConfig.ip,
+            port: hostConfig.port,
+            username: hostConfig.username,
+            name: hostConfig.name,
+          }}
+          backgroundColor={backgroundColor}
+        />
+
+        <PassphraseDialog
+          isOpen={showPassphraseDialog}
+          onSubmit={handlePassphraseSubmit}
+          onCancel={handlePassphraseCancel}
+          hostInfo={{
+            ip: hostConfig.ip,
+            port: hostConfig.port,
+            username: hostConfig.username,
+            name: hostConfig.name,
+          }}
+          backgroundColor={backgroundColor}
+        />
+
+        <WarpgateDialog
+          isOpen={warpgateAuthRequired}
+          url={warpgateAuthUrl}
+          securityKey={warpgateSecurityKey}
+          onContinue={handleWarpgateContinue}
+          onCancel={handleWarpgateCancel}
+          onOpenUrl={handleWarpgateOpenUrl}
+          backgroundColor={backgroundColor}
+        />
+
+        {opksshDialog?.isOpen && (
+          <OPKSSHDialog
+            isOpen={opksshDialog.isOpen}
+            authUrl={opksshDialog.authUrl}
+            requestId={opksshDialog.requestId}
+            stage={opksshDialog.stage}
+            error={opksshDialog.error}
+            providers={opksshDialog.providers}
+            onCancel={() => {
+              if (webSocketRef.current) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "opkssh_cancel",
+                    data: { requestId: opksshDialog.requestId },
+                  }),
+                );
+              }
+              setOpksshDialog(null);
+              if (opksshTimeoutRef.current) {
+                clearTimeout(opksshTimeoutRef.current);
+                opksshTimeoutRef.current = null;
+              }
+            }}
+            onOpenUrl={() => {
+              window.open(opksshDialog.authUrl, "_blank");
+              if (webSocketRef.current) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "opkssh_browser_opened",
+                    data: { requestId: opksshDialog.requestId },
+                  }),
+                );
+              }
+            }}
+            onSelectProvider={(alias) => {
+              if (!opksshDialog.authUrl) return;
+              const selectUrl = `${opksshDialog.authUrl}/select?op=${encodeURIComponent(alias)}`;
+              window.open(selectUrl, "_blank");
+              if (webSocketRef.current) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "opkssh_browser_opened",
+                    data: { requestId: opksshDialog.requestId },
+                  }),
+                );
+              }
+              setOpksshDialog((prev) =>
+                prev ? { ...prev, stage: "waiting" } : null,
+              );
+            }}
+            backgroundColor={backgroundColor}
+          />
+        )}
+
+        {vaultDialog && (
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60">
+            <div className="w-[420px] max-w-[90%] border border-border bg-background p-5 shadow-lg">
+              <h3 className="text-sm font-bold mb-2 text-foreground">
+                {vaultDialog.stage === "error"
+                  ? t("terminal.vaultAuthFailed")
+                  : t("terminal.vaultAuthTitle")}
+              </h3>
+              {vaultDialog.stage === "error" ? (
+                <p className="text-xs text-destructive mb-4 break-words">
+                  {vaultDialog.error || t("terminal.vaultAuthFailed")}
+                </p>
+              ) : (
+                <p className="text-xs text-muted-foreground mb-4">
+                  {t("terminal.vaultAuthDescription")}
+                </p>
+              )}
+              <div className="flex justify-end gap-2">
+                {vaultDialog.stage === "waiting" && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      try {
+                        vaultPopupRef.current?.focus();
+                      } catch {
+                        // popup may be gone
+                      }
+                    }}
+                  >
+                    {t("terminal.vaultReopen")}
+                  </Button>
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    if (vaultTimeoutRef.current) {
+                      clearTimeout(vaultTimeoutRef.current);
+                      vaultTimeoutRef.current = null;
+                    }
+                    try {
+                      vaultPopupRef.current?.close();
+                    } catch {
+                      // popup may already be closed
+                    }
+                    webSocketRef.current?.send(
+                      JSON.stringify({
+                        type: "vault_cancel",
+                        data: { hostId: currentHostIdRef.current },
+                      }),
+                    );
+                    setVaultDialog(null);
+                  }}
+                >
+                  {vaultDialog.stage === "error"
+                    ? t("common.close")
+                    : t("hosts.cancelBtn")}
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {hostKeyVerification?.isOpen && (
+          <HostKeyVerificationDialog
+            isOpen={true}
+            scenario={hostKeyVerification.scenario}
+            {...hostKeyVerification.data}
+            onAccept={() => {
+              if (webSocketRef.current) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "host_key_verification_response",
+                    data: { action: "accept" },
+                  }),
+                );
+              }
+              setHostKeyVerification(null);
+            }}
+            onReject={() => {
+              if (webSocketRef.current) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "host_key_verification_response",
+                    data: { action: "reject" },
+                  }),
+                );
+              }
+              setHostKeyVerification(null);
+              setIsConnecting(false);
+              updateConnectionError(t("terminal.hostKeyRejected"));
+            }}
+            backgroundColor={backgroundColor}
+          />
+        )}
+
+        {tmuxSessionPicker && (
+          <TmuxSessionPicker
+            isOpen={true}
+            sessions={tmuxSessionPicker.sessions}
+            onSelect={(sessionName) => {
+              setTmuxSessionPicker(null);
+              if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "tmux_attach",
+                    data: { sessionName },
+                  }),
+                );
+              }
+              setTimeout(() => terminal?.focus(), 50);
+            }}
+            onCreateNew={() => {
+              setTmuxSessionPicker(null);
+              if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "tmux_attach",
+                    data: { sessionName: "" },
+                  }),
+                );
+              }
+              setTimeout(() => terminal?.focus(), 50);
+            }}
+            onCancel={() => setTmuxSessionPicker(null)}
+            backgroundColor={backgroundColor}
+          />
+        )}
+
+        <CommandAutocomplete
+          visible={showAutocomplete}
+          suggestions={autocompleteSuggestions}
+          selectedIndex={autocompleteSelectedIndex}
+          position={autocompletePosition}
+          onSelect={handleAutocompleteSelect}
+        />
+
+        {linkClickDialog &&
+          createPortal(
+            <div
+              className="fixed inset-0 flex items-center justify-center z-[10000]"
+              style={{ backgroundColor: "rgba(0,0,0,0.5)" }}
+              onClick={() => setLinkClickDialog(null)}
+            >
+              <div
+                className="flex flex-col gap-3 p-4 rounded shadow-lg max-w-sm w-full mx-4"
+                style={{ backgroundColor }}
+                onClick={(event) => event.stopPropagation()}
+              >
+                <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">
+                  {t("terminal.linkDialogTitle")}
+                </p>
+                <p className="text-sm break-all text-foreground select-all">
+                  {linkClickDialog.url}
+                </p>
+                <div className="flex gap-2 justify-end">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      writeTextToClipboard(linkClickDialog.url);
+                      setLinkClickDialog(null);
+                    }}
+                  >
+                    {t("terminal.linkDialogCopy")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      window.open(
+                        linkClickDialog.url,
+                        "_blank",
+                        "noopener,noreferrer",
+                      );
+                      setLinkClickDialog(null);
+                    }}
+                  >
+                    {t("terminal.linkDialogOpen")}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setLinkClickDialog(null)}
+                  >
+                    {t("common.cancel")}
+                  </Button>
+                </div>
+              </div>
+            </div>,
+            document.body,
+          )}
+      </div>
+    );
+  },
+);
+
+export const Terminal = forwardRef<TerminalHandle, SSHTerminalProps>(
+  function Terminal(props, ref) {
+    return (
+      <ConnectionLogProvider>
+        <TerminalInner {...props} ref={ref} />
+      </ConnectionLogProvider>
+    );
+  },
+);

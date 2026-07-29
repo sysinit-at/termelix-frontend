@@ -1,0 +1,330 @@
+/* eslint-disable react-refresh/only-export-components */
+import {
+  FolderSearch,
+  LayoutDashboard,
+  Network,
+  Server,
+  Settings,
+  Terminal,
+  Usb,
+  User,
+  TerminalSquare,
+  Layers, // --- tmux-monitor ---
+} from "lucide-react";
+import { lazy, Suspense } from "react";
+import { useTranslation } from "react-i18next";
+import type { SerialHandle } from "@/features/serial/serial-types";
+import type {
+  TerminalHandle,
+  TerminalHostConfig,
+} from "@/features/terminal/Terminal";
+import { useIsMobile } from "@/hooks/use-mobile";
+import type { Tab, TabType, Host } from "@/types/ui-types";
+import type { SSHHost } from "@/types";
+import { useTabsSafe } from "@/shell/TabContext";
+
+// Heavy tab surfaces — keep out of the AppShell critical path.
+const CommandHistoryProvider = lazy(() =>
+  import("@/features/terminal/command-history/CommandHistoryContext").then(
+    (m) => ({ default: m.CommandHistoryProvider }),
+  ),
+);
+const TerminalFeature = lazy(() =>
+  import("@/features/terminal/Terminal").then((m) => ({
+    default: m.Terminal,
+  })),
+);
+const MobileTerminalKeyboard = lazy(() =>
+  import("@/features/terminal/MobileTerminalKeyboard").then((m) => ({
+    default: m.MobileTerminalKeyboard,
+  })),
+);
+const FileManager = lazy(() =>
+  import("@/features/file-manager/FileManager").then((m) => ({
+    default: m.FileManager,
+  })),
+);
+const TmuxMonitor = lazy(() =>
+  import("@/features/tmux-monitor/TmuxMonitor").then((m) => ({
+    default: m.TmuxMonitor,
+  })),
+);
+const DashboardTab = lazy(() =>
+  import("@/dashboard/DashboardTab").then((m) => ({
+    default: m.DashboardTab,
+  })),
+);
+const TunnelTab = lazy(() =>
+  import("@/features/tunnel/TunnelTab").then((m) => ({
+    default: m.TunnelTab,
+  })),
+);
+const Serial = lazy(() =>
+  import("@/features/serial/Serial").then((m) => ({
+    default: m.Serial,
+  })),
+);
+
+function hostToSSHHost(h: Host): SSHHost {
+  return {
+    id: parseInt(h.id, 10),
+    name: h.name,
+    ip: h.ip,
+    port: h.port,
+    username: h.username,
+    folder: h.folder ?? "",
+    tags: h.tags ?? [],
+    pin: h.pin ?? false,
+    authType: h.authType,
+    password: h.password,
+    key: h.key,
+    keyPassword: h.keyPassword,
+    keyType: h.keyType,
+    credentialId: h.credentialId ? parseInt(h.credentialId, 10) : undefined,
+    terminalConfig: h.terminalConfig,
+    enableTerminal: h.enableTerminal ?? false,
+    enableTunnel: h.enableTunnel ?? false,
+    enableFileManager: h.enableFileManager ?? false,
+    showTerminalInSidebar: true,
+    showFileManagerInSidebar: true,
+    showTunnelInSidebar: true,
+    showServerStatsInSidebar: true,
+    defaultPath: h.defaultPath ?? "",
+    tunnelConnections: [],
+    connectionType: "ssh",
+    createdAt: "",
+    updatedAt: "",
+  } as SSHHost;
+}
+
+function EmptyState({
+  icon: Icon,
+  messageKey,
+}: {
+  icon: React.ElementType;
+  messageKey: string;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex flex-col items-center justify-center flex-1 gap-3 p-6 text-center">
+      <div className="size-10 rounded-full bg-muted/40 flex items-center justify-center">
+        <Icon className="size-5 text-muted-foreground/30" />
+      </div>
+      <span className="text-sm font-semibold text-muted-foreground/60">
+        {t(messageKey)}
+      </span>
+    </div>
+  );
+}
+
+function TabChunkFallback() {
+  return (
+    <div className="flex h-full w-full items-center justify-center bg-background">
+      <div className="size-5 rounded-full border-2 border-muted-foreground/30 border-t-muted-foreground/70 animate-spin" />
+    </div>
+  );
+}
+
+function withTabSuspense(node: React.ReactNode) {
+  return <Suspense fallback={<TabChunkFallback />}>{node}</Suspense>;
+}
+
+export function tabIcon(type: TabType) {
+  switch (type) {
+    case "dashboard":
+      return <LayoutDashboard className="size-3.5" />;
+    case "terminal":
+      return <Terminal className="size-3.5" />;
+    case "files":
+      return <FolderSearch className="size-3.5" />;
+    case "host-manager":
+      return <Server className="size-3.5" />;
+    case "user-profile":
+      return <User className="size-3.5" />;
+    case "admin-settings":
+      return <Settings className="size-3.5" />;
+    case "tunnel":
+      return <Network className="size-3.5" />;
+    // --- tmux-monitor ---
+    case "tmux_monitor":
+      return <Layers className="size-3.5" />;
+    case "serial":
+      return <Usb className="size-3.5" />;
+  }
+}
+
+function TerminalTabContent({
+  tab,
+  host,
+  label,
+  isVisible,
+  onCloseTab,
+  onRenameTab,
+  onOpenFileInEditor,
+  onOpenFileManager,
+}: {
+  tab: Tab;
+  host: Host;
+  label: string;
+  isVisible: boolean;
+  onCloseTab?: (id: string) => void;
+  onRenameTab?: (tabId: string, newLabel: string) => void;
+  onOpenFileInEditor?: (filePath: string) => void;
+  onOpenFileManager?: (path?: string) => void;
+}) {
+  const { previewTerminalTheme } = useTabsSafe();
+  const isMobile = useIsMobile();
+  return withTabSuspense(
+    <CommandHistoryProvider>
+      <div className="flex flex-col h-full w-full">
+        <div className="flex-1 min-h-0">
+          <TerminalFeature
+            ref={tab.terminalRef as React.Ref<TerminalHandle>}
+            hostConfig={
+              {
+                ...hostToSSHHost(host),
+                sshPort: host.sshPort ?? host.port,
+                instanceId: tab.instanceId ?? tab.id,
+                restoredSessionId: tab.restoredSessionId ?? null,
+              } as TerminalHostConfig
+            }
+            isVisible={isVisible}
+            initialPath={tab.initialFilePath}
+            // Set when the tab was opened from the sessions column: attach to THAT session
+            // rather than the host's default one.
+            tmuxAttachSession={tab.tmuxSession}
+            title={label}
+            showTitle={false}
+            splitScreen={false}
+            onClose={() => onCloseTab?.(tab.id)}
+            onTitleChange={
+              onRenameTab && host.terminalConfig?.useSSHTitle
+                ? (title) => onRenameTab(tab.id, title)
+                : undefined
+            }
+            previewTheme={previewTerminalTheme}
+            onOpenFileInEditor={onOpenFileInEditor}
+            onOpenFileManager={onOpenFileManager}
+          />
+        </div>
+        {isMobile && (
+          <MobileTerminalKeyboard
+            terminalRef={
+              tab.terminalRef as React.RefObject<TerminalHandle | null>
+            }
+          />
+        )}
+      </div>
+    </CommandHistoryProvider>,
+  );
+}
+
+export function renderTabContent(
+  tab: Tab,
+  onOpenSingletonTab?: (type: TabType) => void,
+  onOpenTab?: (host: Host, type: TabType) => void,
+  onCloseTab?: (id: string) => void,
+  isVisible = true,
+  onOpenFileInEditor?: (host: Host, filePath: string) => void,
+  onOpenFileManager?: (host: Host, path?: string) => void,
+  onOpenTerminalTab?: (host: Host, path?: string) => void,
+  onRenameTab?: (tabId: string, newLabel: string) => void,
+) {
+  const { host, label } = tab;
+
+  switch (tab.type) {
+    case "dashboard":
+      return withTabSuspense(
+        <DashboardTab
+          onOpenSingletonTab={onOpenSingletonTab!}
+          onOpenTab={onOpenTab!}
+          isVisible={isVisible}
+        />,
+      );
+
+    case "terminal":
+      if (!host)
+        return (
+          <EmptyState
+            icon={TerminalSquare}
+            messageKey="terminal.noHostSelected"
+          />
+        );
+      return (
+        <TerminalTabContent
+          tab={tab}
+          host={host}
+          label={label}
+          isVisible={isVisible}
+          onCloseTab={onCloseTab}
+          onRenameTab={onRenameTab}
+          onOpenFileInEditor={
+            onOpenFileInEditor
+              ? (fp) => onOpenFileInEditor(host, fp)
+              : undefined
+          }
+          onOpenFileManager={
+            onOpenFileManager ? (p) => onOpenFileManager(host, p) : undefined
+          }
+        />
+      );
+
+    case "files":
+      if (!host)
+        return (
+          <EmptyState
+            icon={FolderSearch}
+            messageKey="fileManager.noHostSelected"
+          />
+        );
+      return withTabSuspense(
+        <FileManager
+          initialHost={hostToSSHHost(host)}
+          initialFilePath={tab.initialFilePath}
+          isVisible={isVisible}
+          onOpenTerminalTab={
+            onOpenTerminalTab
+              ? (path) => onOpenTerminalTab(host, path)
+              : undefined
+          }
+        />,
+      );
+
+    case "tunnel":
+      return withTabSuspense(
+        <TunnelTab label={label} host={host} isVisible={isVisible} />,
+      );
+
+    // --- tmux-monitor ---
+    case "tmux_monitor":
+      return withTabSuspense(
+        <TmuxMonitor
+          initialHostId={host ? parseInt(host.id, 10) : undefined}
+          isVisible={isVisible}
+        />,
+      );
+
+    case "serial":
+      if (!tab.serialConfig)
+        return <EmptyState icon={Usb} messageKey="serial.notSupportedTitle" />;
+      return withTabSuspense(
+        <Serial
+          ref={tab.terminalRef as React.Ref<SerialHandle>}
+          config={tab.serialConfig}
+          isVisible={isVisible}
+          instanceId={tab.instanceId}
+        />,
+      );
+
+    case "host-manager":
+    case "user-profile":
+    case "admin-settings":
+      return null;
+
+    // A tab whose type is unknown here (e.g. an orphan persisted before a feature was
+    // removed) renders nothing rather than crashing. Restore paths already filter these
+    // out; this is defensive.
+    default:
+      return null;
+  }
+}

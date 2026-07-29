@@ -2,9 +2,11 @@
 #
 # The publish script strips every other workflow file: the remaining upstream
 # workflows (release, electron, docker, …) expect upstream secrets and would
-# only fail noisily on the mirror. This one proves the SPA builds and the unit
-# suite passes — the same `--ignore-scripts` install the Termelix image build
-# uses.
+# only fail noisily on the mirror. This one proves exactly what the Termelix
+# image build needs: the SPA builds from an `--ignore-scripts` install. The
+# test suite is NOT run here — upstream's retired-backend tests need native
+# modules (better-sqlite3) that an --ignore-scripts install deliberately
+# never compiles; tests run in the fork's own dev flow instead.
 
 name: build
 
@@ -30,5 +32,3 @@ jobs:
       - run: npm install --ignore-scripts --no-audit --no-fund
 
       - run: npx vite build
-
-      - run: npm test

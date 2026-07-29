@@ -1,4 +1,4 @@
-> **Fork notice:** this is the sysinit fork of [Termix](https://github.com/Termix-SSH/Termix) — the SPA served by [Termelix](https://github.com/sysinit-at/termelix), the Elixir/Phoenix port of the Termix server. Published as sanitized snapshots; the original app and its docs live upstream.
+> **Fork notice:** this is the sysinit fork of [Termix](https://github.com/Termix-SSH/Termix). It provides the React SPA for [Termelix](https://github.com/sysinit-at/termelix) — self-hosted SSH & remote management on the Erlang VM, its own product that began as a Termix port and has since diverged in features. Published as sanitized snapshots; the original app and its docs live upstream.
 
 <div align="center">
 
